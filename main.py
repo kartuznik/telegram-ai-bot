@@ -1,0 +1,1973 @@
+import asyncio
+import base64
+import logging
+import re
+import time
+import mimetypes
+import os
+import re
+import tempfile
+from io import BytesIO
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramNetworkError,
+)
+from aiohttp import ClientError
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
+
+from app.admin import (
+    NO_ADMIN_RIGHTS,
+    ban_user,
+    broadcast_message,
+    get_users_preview,
+    init_admin_db,
+    is_admin,
+    unban_user,
+)
+from app.content_editor import (
+    AUTO_DIRECTIVE_RE,
+    DEFAULT_EDITOR_CHANNEL_ID,
+    PREF_APPROVE_COUNT,
+    PREF_AUTO_INTRO_SENT,
+    PREF_LAST_AUTO_FETCH_TS,
+    PREF_CHANNEL,
+    PREF_ENABLED,
+    PREF_REJECT_COUNT,
+    PREF_SOURCES,
+    PREF_TG_CHANNELS,
+    PREF_TOPICS,
+    PREF_SOURCE_MODE,
+    PREF_AUTO_DISABLED_REASON,
+    PREF_AUTO_ENABLED,
+    auto_interval_hours_from_prefs,
+    append_reject_hint,
+    MAX_PENDING_UNAPPROVED_DRAFTS,
+    build_editor_keyboard,
+    bump_approve,
+    count_drafts,
+    create_draft_from_search,
+    draft_dm_text,
+    format_editor_info_text,
+    get_draft,
+    get_oldest_draft,
+    get_pending_edit,
+    get_source_mode,
+    hint_for_reject_from_draft,
+    init_content_editor_defaults,
+    is_auto_enabled_pref,
+    is_editor_callback,
+    is_editor_enabled,
+    is_private_chat,
+    maybe_note_shorter_edit,
+    migrate_strip_vesti_reject_hints,
+    parse_auto_directive_from_rest,
+    parse_editor_callback,
+    parse_editor_extra_directives,
+    pop_pending_edit,
+    reset_editor_reject_state,
+    set_draft_status,
+    set_pending_edit,
+    update_draft_content,
+)
+from app.content_editor_background import run_content_editor_autofetch_loop
+from app.scenario_simulator import (
+    build_scenario_choice_keyboard,
+    build_scenario_deep_keyboard,
+    classify_scenario_request,
+    format_scenario_intro,
+    generate_scenarios,
+    get_session,
+    is_scenario_callback,
+    parse_scenario_callback,
+    put_session,
+    run_scenario_expand,
+)
+from app.selftest import BotSelfTest
+from app.database import init_db
+from app.config import load_config
+from app.middlewares.admin_auth import AdminAuthMiddleware
+from app.middlewares.ban_check import BanCheckMiddleware
+from app.statistics import (
+    get_daily_breakdown,
+    get_stats,
+    get_top_users,
+    init_stats_db,
+    log_user_message,
+)
+from app.llm_agent import LLMAgent
+from app.memory import ChatMemory
+from app.proxy_utils import socks5_proxy_url_from_config
+from app.pdf_extractor import extract_text_from_pdf, extract_text_from_txt
+from app.telegram_ui import (
+    CALLBACK_START_HELP,
+    build_default_keyboard,
+    build_help_text,
+    build_keyboard_from_buttons,
+    build_start_keyboard,
+    reply_with_help_text,
+    setup_bot_command_menu,
+)
+from app.user_anchors import (
+    auto_title_anchor,
+    build_anchor_view_keyboard,
+    build_anchors_list_keyboard,
+    classify_anchor_command,
+    delete_anchor_by_id,
+    delete_anchor_by_title,
+    format_anchor_message,
+    build_anchor_snippet_and_ref,
+    get_anchor,
+    insert_anchor,
+    is_anchor_callback,
+    list_anchor_rows,
+    parse_anchor_callback,
+)
+from app.user_templates import (
+    auto_title_from_content,
+    build_template_view_keyboard,
+    build_templates_list_keyboard,
+    classify_save_template_command,
+    delete_template_by_id,
+    delete_template_by_title,
+    extract_save_title,
+    format_template_body,
+    get_last_assistant_reply,
+    get_template,
+    insert_template,
+    is_template_callback,
+    list_template_rows,
+    looks_like_list_templates_command,
+    parse_delete_template_title,
+    parse_template_callback,
+    user_explicitly_wants_own_message_saved,
+)
+
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+config = load_config()
+memory = ChatMemory(max_messages=config.max_history_messages)
+init_content_editor_defaults(config)
+migrate_strip_vesti_reject_hints(memory)
+agent = LLMAgent(config=config, memory=memory)
+
+router = Router()
+
+_telegram_direct_fallback_applied = False
+
+
+async def _switch_telegram_to_direct_session(bot: Bot) -> None:
+    """Закрывает прокси-сессию и подставляет обычный AiohttpSession (один раз за процесс)."""
+    global _telegram_direct_fallback_applied
+    if _telegram_direct_fallback_applied:
+        return
+    old = bot.session
+    try:
+        await old.close()
+    except Exception as exc:
+        logger.debug("Telegram session close: %s", exc)
+    bot.session = AiohttpSession()
+    _telegram_direct_fallback_applied = True
+    logger.warning(
+        "Telegram Bot API: включено прямое подключение (TELEGRAM_PROXY_FALLBACK_DIRECT)"
+    )
+
+
+async def safe_send_chat_action(
+    bot: Bot,
+    chat_id: int,
+    action: str = "typing",
+) -> None:
+    """send_chat_action с retry; сетевые сбои прокси не роняют хендлер."""
+    delays = (1.0, 2.0, 4.0)
+    last_exc: BaseException | None = None
+
+    for attempt in range(3):
+        try:
+            await bot.send_chat_action(chat_id, action)
+            return
+        except asyncio.CancelledError:
+            raise
+        except TelegramAPIError as exc:
+            if not isinstance(exc, TelegramNetworkError):
+                logger.debug("send_chat_action: без retry (%s)", exc)
+                return
+            last_exc = exc
+        except (ClientError, TimeoutError, OSError) as exc:
+            last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+
+        if attempt < 2:
+            await asyncio.sleep(delays[attempt])
+
+    logger.warning(
+        "send_chat_action: сбой после 3 попыток (chat_id=%s): %s",
+        chat_id,
+        last_exc,
+    )
+
+    if (
+        config.telegram_proxy_fallback_direct
+        and socks5_proxy_url_from_config(config)
+        and not _telegram_direct_fallback_applied
+    ):
+        try:
+            await _switch_telegram_to_direct_session(bot)
+            try:
+                await bot.send_chat_action(chat_id, action)
+            except Exception as exc:
+                logger.warning("send_chat_action после fallback: %s", exc)
+        except Exception:
+            logger.exception("Не удалось переключить Telegram на прямую сессию")
+
+
+def build_telegram_session() -> AiohttpSession | None:
+    # Proxy applies only to Telegram API requests.
+    proxy_url = socks5_proxy_url_from_config(config)
+    if not proxy_url:
+        return None
+    return AiohttpSession(proxy=proxy_url)
+
+
+async def _send_templates_list(message: Message, user_id: int) -> None:
+    rows = list_template_rows(user_id)
+    if not rows:
+        await message.answer(
+            "Пока пусто — сохрани любой мой ответ фразой вроде «сохрани это», "
+            "и потом заглядывай сюда как в блокнот удачи 📔"
+        )
+        return
+    kb = build_templates_list_keyboard(rows)
+    await message.answer(
+        f"Вот твои шаблоны ({len(rows)} шт.) — жми на название, открою текст:",
+        reply_markup=kb,
+    )
+
+
+async def _send_anchors_list(message: Message, user_id: int) -> None:
+    rows = list_anchor_rows(user_id)
+    if not rows:
+        await message.answer(
+            "Пока якорей нет — поставь метку фразой вроде «запомни этот момент» или «якорь: тема», "
+            "и я пришпилю разговор, как стикер на холодильник 🧲🔖"
+        )
+        return
+    kb = build_anchors_list_keyboard(rows)
+    await message.answer(
+        f"Твои якоря ({len(rows)} шт.) — жми на название, вспомним момент:",
+        reply_markup=kb,
+    )
+
+
+async def send_ai_reply(
+    message: Message, text: str, buttons: list[dict[str, str]] | None = None
+) -> None:
+    if buttons:
+        keyboard = build_keyboard_from_buttons(buttons)
+    else:
+        keyboard, _ = build_default_keyboard()
+    await message.answer(text, reply_markup=keyboard)
+
+
+def resolve_proactive_buttons(
+    user_id: int,
+    context_text: str,
+    model_buttons: list[dict[str, str]] | None,
+    is_generic: bool = False,
+    user_query: str | None = None,
+) -> list[dict[str, str]]:
+    """Возвращает кнопки: от модели ИЛИ фоллбэк если модель дала универсальные."""
+
+    logger.info("Кнопки от GPT: %s", [b["text"] for b in (model_buttons or [])])
+
+    if model_buttons and len(model_buttons) >= 2 and not is_generic:
+        logger.info("Источник кнопок: GPT | Кнопки универсальные? Нет | Фоллбэк? Нет")
+        return model_buttons[:3]
+
+    reasons: list[str] = []
+    if not model_buttons:
+        reasons.append("нет JSON от GPT")
+    elif len(model_buttons) < 2:
+        reasons.append("мало кнопок (<2)")
+    if is_generic:
+        reasons.append("generic-текст в кнопках")
+    logger.info(
+        "Источник кнопок: fallback | Причина: %s | Фоллбэк? Да",
+        ", ".join(reasons) if reasons else "неизвестно",
+    )
+    snippet = context_text[:200].replace("\n", " ")
+    if len(context_text) > 200:
+        snippet += "..."
+    logger.info(
+        "fallback: анализируем текст последнего ответа бота (%s символов): %s",
+        len(context_text),
+        snippet,
+    )
+    if user_query and user_query.strip():
+        uq = user_query.strip()
+        logger.info(
+            "fallback: текущий запрос пользователя (%s символов): %s",
+            len(uq),
+            uq[:200].replace("\n", " ") + ("..." if len(uq) > 200 else ""),
+        )
+    buttons, branch = generate_context_buttons_fallback(context_text, user_query=user_query)
+    logger.info("Fallback ветка: %s | ключи (фрагмент ответа): %s", branch, context_text[:120].replace("\n", " "))
+    return buttons
+
+
+@router.message(Command("start"))
+async def start_cmd(message: Message) -> None:
+    await message.answer(
+        "Привет! 👋 Я Кузьма — твой AI-помощник.\n"
+        "Пришли текст, PDF или TXT файл, и я помогу с разбором 😊",
+        reply_markup=build_start_keyboard(),
+    )
+
+
+@router.message(Command("help"))
+async def help_cmd(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    await message.answer(build_help_text(is_admin=is_admin(uid)))
+
+
+@router.message(Command("templates"))
+async def templates_cmd(message: Message) -> None:
+    if not message.from_user:
+        return
+    await _send_templates_list(message, message.from_user.id)
+
+
+@router.message(Command("bookmarks"))
+async def bookmarks_cmd(message: Message) -> None:
+    if not message.from_user:
+        return
+    await _send_anchors_list(message, message.from_user.id)
+
+
+@router.message(Command("simulate"))
+async def simulate_cmd(message: Message, bot: Bot) -> None:
+    """Симулятор сценариев из меню: вопрос в той же строке после /simulate."""
+    if not message.from_user:
+        return
+    topic = (message.text or "").partition(" ")[2].strip()
+    if not topic:
+        await message.answer(
+            "Симулятор сценариев: напиши вопрос в одной строке, например:\n"
+            "/simulate Стоит ли брать ипотеку под высокий процент?\n\n"
+            "Или без команды: «Что если…», «Какие варианты…» — тоже сработает 🎲"
+        )
+        return
+    await _run_scenario_for_user_message(message, bot, message.from_user.id, topic)
+
+
+async def _editor_require_private(message: Message) -> bool:
+    if not message.from_user:
+        return False
+    if not is_private_chat(message):
+        await message.answer(
+            "Редактор контента — только в личке со мной. Напиши мне в ЛС: там черновики и кнопки апрува ✍️😊"
+        )
+        return False
+    return True
+
+
+@router.message(Command("editor_start"))
+async def editor_start_cmd(message: Message) -> None:
+    if not await _editor_require_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    memory.update_style_preferences(
+        uid,
+        {
+            PREF_ENABLED: "1",
+            PREF_CHANNEL: DEFAULT_EDITOR_CHANNEL_ID,
+        },
+    )
+    pop_pending_edit(uid)
+    await message.answer(
+        f"Редактор включён 🎉 Цель — канал @kriptogeograph (`{DEFAULT_EDITOR_CHANNEL_ID}`). "
+        "Дальше: /editor_prefs биткоин,defi — темы и уточнение через запятую, потом /drafts — "
+        "принесу черновик с кнопками ✅✏️❌. Хочешь, чтобы я сам иногда приносил черновики — "
+        "/editor_prefs авто:24 (раз в сутки, часы настраиваются). В канал без тебя ничего не уйдёт — "
+        "только после ✅ «Опубликовать» 🎯"
+    )
+
+
+@router.message(Command("editor_stop"))
+async def editor_stop_cmd(message: Message) -> None:
+    if not await _editor_require_private(message) or not message.from_user:
+        return
+    memory.update_style_preferences(
+        message.from_user.id,
+        {PREF_ENABLED: "0", PREF_AUTO_ENABLED: "0"},
+    )
+    pop_pending_edit(message.from_user.id)
+    await message.answer(
+        "Поставил редактор на паузу ⏸️ Черновики в базе остаются — снова включить: /editor_start ✍️"
+    )
+
+
+@router.message(Command("editor_prefs"))
+async def editor_prefs_cmd(message: Message) -> None:
+    if not await _editor_require_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    raw_rest = (message.text or "").partition(" ")[2].strip()
+    prefs = memory.get_style_preferences(uid)
+
+    if not raw_rest:
+        topics = prefs.get(PREF_TOPICS, "— ещё не задавали")
+        sources = prefs.get(PREF_SOURCES, "—")
+        sm = get_source_mode(prefs)
+        tg_extra = (prefs.get(PREF_TG_CHANNELS) or "").strip() or "—"
+        rc = prefs.get(PREF_REJECT_COUNT, "0")
+        ac = prefs.get(PREF_APPROVE_COUNT, "0")
+        ae = "включён" if is_auto_enabled_pref(prefs) else "выключен"
+        ah = auto_interval_hours_from_prefs(prefs)
+        reason = (prefs.get(PREF_AUTO_DISABLED_REASON) or "").strip()
+        extra = f"\nАвто-поиск черновиков: {ae}, интервал ~{ah} ч"
+        if reason and not is_auto_enabled_pref(prefs):
+            extra += f" (остановка: {reason[:120]}{'…' if len(reason) > 120 else ''})"
+        await message.answer(
+            f"Текущие темы: {topics}\n"
+            f"Уточнение к поиску (вторая часть после запятой): {sources}\n"
+            f"Режим материалов: {sm} (web / tg / both) — см. источники: в /editor_prefs\n"
+            f"Свои TG-каналы (если заданы — при поиске только они): {tg_extra[:200]}{'…' if len(tg_extra) > 200 else ''}\n"
+            f"Счётчики: апрувов {ac}, отказов {rc} — на них мягко опираюсь при подборе 📊{extra}\n\n"
+            "Только темы: /editor_prefs темы:мемы,юмор или /editor_prefs темы мемы,юмор\n"
+            "Только TG: /editor_prefs тгканалы:@a,@b или /editor_prefs тгканалы @a @b\n"
+            "Источники: /editor_prefs источники:both (или web, tg)\n"
+            "Старый стиль: /editor_prefs биткоин,defi — темы и уточнение одной строкой\n"
+            "Сброс отказов/банов по каналам: /editor_reset_rejects\n"
+            "Авто: /editor_prefs авто:24 или /editor_prefs авто:off"
+        )
+        return
+
+    prefs_before = prefs
+    extra_clean, extra_updates = parse_editor_extra_directives(raw_rest)
+    if extra_updates:
+        memory.update_style_preferences(uid, extra_updates)
+        if PREF_TG_CHANNELS in extra_updates:
+            logger.info(
+                "editor_prefs saved user_id=%s tg_channels=%s",
+                uid,
+                extra_updates[PREF_TG_CHANNELS][:500],
+            )
+        elif PREF_TOPICS in extra_updates:
+            logger.info(
+                "editor_prefs saved user_id=%s topics=%r sources=%r",
+                uid,
+                (extra_updates.get(PREF_TOPICS) or "")[:200],
+                (extra_updates.get(PREF_SOURCES) or "")[:200],
+            )
+        else:
+            logger.info(
+                "editor_prefs saved user_id=%s keys=%s",
+                uid,
+                list(extra_updates.keys()),
+            )
+
+    auto_cleaned, auto_updates = parse_auto_directive_from_rest(extra_clean)
+    if auto_updates is None and re.search(r"(?is)авто\s*:", extra_clean) and not AUTO_DIRECTIVE_RE.search(extra_clean):
+        await message.answer(
+            "Не разобрал «авто». Примеры: авто:24 — раз в 24 часа, авто:off — выключить автодобычу черновиков 🧪"
+        )
+        return
+
+    rest_topics = (auto_cleaned if auto_updates is not None else extra_clean).strip()
+
+    if auto_updates:
+        was_auto = is_auto_enabled_pref(prefs_before)
+        memory.update_style_preferences(uid, auto_updates)
+        prefs_mid = memory.get_style_preferences(uid)
+        now_auto = is_auto_enabled_pref(prefs_mid)
+        if now_auto and not was_auto:
+            ts_upd: dict[str, str] = {PREF_LAST_AUTO_FETCH_TS: str(time.time())}
+            need_intro = prefs_before.get(PREF_AUTO_INTRO_SENT, "").strip() != "1"
+            if need_intro:
+                ts_upd[PREF_AUTO_INTRO_SENT] = "1"
+            memory.update_style_preferences(uid, ts_upd)
+            if need_intro:
+                await message.answer(
+                    "Авто-поиск включён 🎰 Буду сам приносить черновики сюда с кнопками — как редактор с подносом, "
+                    "только поднос цифровой. В канал ничего не вылетит без твоего ✅. Надоело — /editor_prefs авто:off 🙃"
+                )
+        elif not now_auto and was_auto:
+            await message.answer(
+                "Авто-поиск выключен — черновики только по твоему /drafts, без самодеятельности 📎✋"
+            )
+
+    bits: list[str] = []
+    if extra_updates:
+        if PREF_SOURCE_MODE in extra_updates:
+            bits.append(f"источники: {extra_updates[PREF_SOURCE_MODE]}")
+        if PREF_TG_CHANNELS in extra_updates:
+            bits.append(
+                f"тгканалы: {extra_updates[PREF_TG_CHANNELS][:100]}{'…' if len(extra_updates[PREF_TG_CHANNELS]) > 100 else ''}"
+            )
+        if PREF_TOPICS in extra_updates:
+            td = (extra_updates.get(PREF_TOPICS) or "").strip()
+            sd = (extra_updates.get(PREF_SOURCES) or "").strip()
+            bits.append(
+                f"темы «{td[:120]}{'…' if len(td) > 120 else ''}», "
+                f"уточнение «{sd[:120]}{'…' if len(sd) > 120 else ''}»"
+            )
+    if rest_topics and PREF_TOPICS not in (extra_updates or {}):
+        if "," in rest_topics:
+            topics_disp, _, tail = rest_topics.partition(",")
+            topics_disp = topics_disp.strip()
+            sources_disp = tail.strip()
+        else:
+            topics_disp = rest_topics.strip()
+            sources_disp = ""
+        memory.update_style_preferences(
+            uid,
+            {
+                PREF_TOPICS: topics_disp[:800],
+                PREF_SOURCES: sources_disp[:800],
+            },
+        )
+        bits.append(
+            f"темы «{topics_disp[:120]}{'…' if len(topics_disp) > 120 else ''}», "
+            f"уточнение «{sources_disp[:120]}{'…' if len(sources_disp) > 120 else ''}»"
+        )
+
+    prefs = memory.get_style_preferences(uid)
+    if auto_updates:
+        if is_auto_enabled_pref(prefs):
+            bits.append(f"авто ~{auto_interval_hours_from_prefs(prefs)} ч")
+        else:
+            bits.append("авто выкл")
+    if not bits:
+        await message.answer("Нечего менять — глянь /editor_prefs без хвоста для сводки 📋")
+        return
+    await message.answer("Записал: " + "; ".join(bits) + " — жми /drafts или жди авто 🚀")
+
+
+@router.message(Command("editor_reset_rejects"))
+async def editor_reset_rejects_cmd(message: Message) -> None:
+    if not await _editor_require_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    if not is_editor_enabled(memory, uid):
+        await message.answer("Сначала /editor_start — сброс относится к редактору ✍️")
+        return
+    nh, nk = reset_editor_reject_state(memory, uid)
+    await message.answer(
+        f"Сбросил отказы: записей в «чёрной тетради» было {nh}, ключей жёсткого бана (сайт или tg:канал) — {nk}. "
+        f"Подбор снова с чистого листа; при ❌ отказах счётчики снова накапливаются 📎"
+    )
+
+
+@router.message(Command("editor_info"))
+async def editor_info_cmd(message: Message) -> None:
+    if not await _editor_require_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    prefs = memory.get_style_preferences(uid)
+    await message.answer(format_editor_info_text(prefs))
+
+
+@router.message(Command("drafts"))
+async def drafts_cmd(message: Message, bot: Bot) -> None:
+    if not await _editor_require_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    if not is_editor_enabled(memory, uid):
+        await message.answer("Сначала /editor_start — без этого я не знаю, что тебе подкладывать в ленту ✍️")
+        return
+    prefs_dm = memory.get_style_preferences(uid)
+    if get_source_mode(prefs_dm) == "web" and not agent.tavily:
+        await message.answer(
+            "Tavily не настроен — в режиме источники:web без веб-поиска не обойтись. Добавь TAVILY_API_KEY в .env "
+            "или поставь /editor_prefs источники:tg / both (both без ключа попробует хотя бы TG) 🌐"
+        )
+        return
+    parts = (message.text or "").strip().split(maxsplit=1)
+    tail = (parts[1] or "").strip().lower() if len(parts) > 1 else ""
+    want_more = tail in ("ещё", "еще", "new", "more", "+")
+
+    pending = count_drafts(uid, "draft")
+    logger.info(
+        "drafts_cmd: user_id=%s pending_drafts=%s limit=%s want_more=%s",
+        uid,
+        pending,
+        MAX_PENDING_UNAPPROVED_DRAFTS,
+        want_more,
+    )
+
+    if want_more:
+        if pending >= MAX_PENDING_UNAPPROVED_DRAFTS:
+            await message.answer(
+                f"Уже {MAX_PENDING_UNAPPROVED_DRAFTS} неразобранных черновиков в очереди — новый не создаю. "
+                "Разгреби ✅/✏️/❌ по текущим, потом снова /drafts ещё 📎"
+            )
+            return
+        await safe_send_chat_action(bot, message.chat.id, "typing")
+        ok, res, _dm = await asyncio.to_thread(create_draft_from_search, agent, memory, uid)
+        if not ok:
+            await message.answer(str(res))
+            return
+        row = get_draft(uid, int(res))
+        if not row:
+            await message.answer("Черновик создался, но я его не вижу — глюк матрицы 🫠")
+            return
+        await message.answer(
+            draft_dm_text(row),
+            reply_markup=build_editor_keyboard(int(res)),
+        )
+        return
+
+    if pending > 0:
+        oldest = get_oldest_draft(uid, "draft")
+        if oldest:
+            extra = (
+                f"\n\nВ очереди ещё {pending - 1} черновик(ов). Свежую подборку в хвост очереди — "
+                f"/drafts ещё (лимит {MAX_PENDING_UNAPPROVED_DRAFTS} шт.)."
+                if pending > 1
+                else f"\n\nЕщё одну подборку в очередь — /drafts ещё (до {MAX_PENDING_UNAPPROVED_DRAFTS} шт.)."
+            )
+            await message.answer(
+                draft_dm_text(oldest) + extra,
+                reply_markup=build_editor_keyboard(int(oldest["id"])),
+            )
+            return
+
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+    ok, res, _dm = await asyncio.to_thread(create_draft_from_search, agent, memory, uid)
+    if not ok:
+        await message.answer(str(res))
+        return
+    row = get_draft(uid, int(res))
+    if not row:
+        await message.answer("Черновик создался, но я его не вижу — глюк матрицы 🫠")
+        return
+    await message.answer(
+        draft_dm_text(row),
+        reply_markup=build_editor_keyboard(int(res)),
+    )
+
+
+async def _handle_editor_revision_message(message: Message, draft_id: int) -> None:
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+    row = get_draft(uid, draft_id)
+    if not row or str(row.get("status")) != "draft":
+        pop_pending_edit(uid)
+        await message.answer("Этот черновик уже не в статусе «черновик» — начни с /drafts ✍️")
+        return
+    old = str(row.get("content") or "")
+    if not update_draft_content(uid, draft_id, text):
+        pop_pending_edit(uid)
+        await message.answer("Не удалось сохранить правки — глянь /drafts 📎")
+        return
+    maybe_note_shorter_edit(memory, uid, old, text)
+    pop_pending_edit(uid)
+    row2 = get_draft(uid, draft_id)
+    if not row2:
+        await message.answer("Странно, черновик пропал — попробуй /drafts 🫠")
+        return
+    await message.answer(
+        draft_dm_text(row2),
+        reply_markup=build_editor_keyboard(draft_id),
+    )
+
+
+@router.message(Command("clear"))
+async def clear_cmd(message: Message) -> None:
+    if message.from_user:
+        memory.clear_user_memory(message.from_user.id)
+        agent.clear_clarification_pending(message.from_user.id)
+    await message.answer("Память диалога очищена 🧹")
+
+
+@router.message(Command("reset_style"))
+async def reset_style_cmd(message: Message) -> None:
+    if message.from_user:
+        memory.clear_style_preferences(message.from_user.id)
+    await message.answer(
+        "Настройки стиля ответа сброшены: снова обычный баланс длины и тона ✨"
+    )
+
+
+@router.message(Command("stats"))
+async def stats_cmd(message: Message) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer(NO_ADMIN_RIGHTS)
+        return
+    stats = get_stats()
+    top = get_top_users(5)
+    daily = get_daily_breakdown(7)
+    lines = [
+        "📊 Статистика бота",
+        "",
+        f"👥 Всего пользователей: {stats['total_users']}",
+        f"💬 Всего сообщений: {stats['total_messages']}",
+        f"📅 Сегодня (сообщений): {stats['today_messages']}",
+        f"👤 Сегодня (уникальных): {stats['today_users']}",
+        "",
+        "📈 Активность по дням (последние 7):",
+    ]
+    if daily:
+        for row in reversed(daily):
+            lines.append(
+                f"  • {row['date']}: 💬 {row['messages']}, 👤 {row['unique_users']}"
+            )
+    else:
+        lines.append("  (пока нет данных)")
+    lines.append("")
+    lines.append("🏆 Топ по сообщениям:")
+    if top:
+        for i, u in enumerate(top, start=1):
+            uname = f"@{u['username']}" if u.get("username") else f"id {u['user_id']}"
+            lines.append(f"  {i}. {uname} — {u['message_count']} сообщ.")
+    else:
+        lines.append("  (пока нет данных)")
+    await message.answer("\n".join(lines))
+
+
+ADMIN_HELP = (
+    "🔧 Панель администратора\n\n"
+    "Доступные команды:\n"
+    "• /broadcast текст — рассылка всем пользователям из статистики "
+    "(или ответьте /broadcast на сообщение)\n"
+    "• /ban <user_id> — заблокировать пользователя\n"
+    "• /unban <user_id> — разблокировать\n"
+    "• /users — список пользователей (до 50)\n"
+    "• /selftest — самодиагностика: шаблоны, якоря, консьерж, БД, ключи API, JSON-кнопки "
+    "(отчёт в чат, в логах INFO по каждому пункту) 🤖✨\n"
+    "• /admin — это меню"
+)
+
+
+@router.message(Command("admin"))
+async def admin_cmd(message: Message) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer(NO_ADMIN_RIGHTS)
+        return
+    await message.answer(ADMIN_HELP)
+
+
+@router.message(Command("selftest"))
+async def selftest_cmd(message: Message) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer(NO_ADMIN_RIGHTS)
+        return
+    tester = BotSelfTest(config=config, agent=agent)
+    results = tester.run_all()
+    report = tester.format_report(results)
+    await message.answer(report)
+
+
+@router.message(Command("broadcast"))
+async def broadcast_cmd(message: Message, bot: Bot) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer(NO_ADMIN_RIGHTS)
+        return
+    text = (message.text or "").partition(" ")[2].strip()
+    if not text and message.reply_to_message and message.reply_to_message.text:
+        text = message.reply_to_message.text.strip()
+    if not text:
+        await message.answer(
+            "Укажите текст после команды или ответьте /broadcast на сообщение, которое нужно разослать."
+        )
+        return
+    n = await broadcast_message(bot, text)
+    await message.answer(f"✅ Рассылка завершена. Доставлено сообщений: {n}")
+
+
+@router.message(Command("ban"))
+async def ban_cmd(message: Message) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer(NO_ADMIN_RIGHTS)
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование: /ban <user_id>")
+        return
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await message.answer("user_id должен быть целым числом.")
+        return
+    if config.admin_id is not None and target == config.admin_id:
+        await message.answer("Нельзя заблокировать администратора.")
+        return
+    if ban_user(target):
+        await message.answer(f"🚫 Пользователь {target} заблокирован.")
+    else:
+        await message.answer("Не удалось заблокировать (см. логи).")
+
+
+@router.message(Command("unban"))
+async def unban_cmd(message: Message) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer(NO_ADMIN_RIGHTS)
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование: /unban <user_id>")
+        return
+    try:
+        target = int(parts[1])
+    except ValueError:
+        await message.answer("user_id должен быть целым числом.")
+        return
+    if unban_user(target):
+        await message.answer(f"✅ Пользователь {target} разблокирован.")
+    else:
+        await message.answer(f"Пользователь {target} не был в списке блокировок.")
+
+
+@router.message(Command("users"))
+async def users_cmd(message: Message) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer(NO_ADMIN_RIGHTS)
+        return
+    rows = get_users_preview(50)
+    if not rows:
+        await message.answer("Пока нет пользователей в статистике.")
+        return
+    lines = ["👥 Пользователи (до 50, по активности):", ""]
+    for r in rows:
+        uname = f"@{r['username']}" if r.get("username") else "—"
+        ban_mark = " 🚫" if r.get("banned") else ""
+        lines.append(f"• id {r['user_id']} {uname} — {r['message_count']} сообщ.{ban_mark}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
+    await message.answer(text)
+
+
+async def _run_scenario_for_user_message(
+    message: Message,
+    bot: Bot,
+    uid: int,
+    topic: str,
+) -> None:
+    """Генерация трёх веток сценария и отправка вводного сообщения с кнопками."""
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+    try:
+        o_blk, r_blk, p_blk, _ = await asyncio.to_thread(
+            generate_scenarios, agent, topic, {}
+        )
+    except Exception as exc:
+        logger.exception("scenario: ошибка генерации: %s", exc)
+        await message.answer(
+            "Симулятор споткнулся об нейросеть — попробуй ещё раз чуть позже или переформулируй вопрос 🎲😅"
+        )
+        return
+    intro = format_scenario_intro(topic, o_blk, r_blk, p_blk)
+    sid = put_session(uid, topic, o_blk, r_blk, p_blk, intro)
+    kb = build_scenario_choice_keyboard(sid)
+    memory.save_user_memory(uid, topic, intro)
+    await message.answer(intro, reply_markup=kb)
+
+
+@router.message(F.text)
+async def text_handler(message: Message, bot: Bot) -> None:
+    if not message.from_user or not message.text:
+        return
+    log_user_message(message.from_user.id, message.from_user.username)
+    uid = message.from_user.id
+    text = message.text
+
+    if is_private_chat(message) and not text.strip().startswith("/"):
+        pe = get_pending_edit(uid)
+        if pe is not None:
+            await _handle_editor_revision_message(message, pe)
+            return
+
+    am, areason, atitle = classify_anchor_command(text)
+    if am:
+        if areason == "delete_empty":
+            await message.answer(
+                "Напиши так: «удали якорь Название» — и я уберу нужную закладку 🗑️🔖"
+            )
+            return
+        if areason == "delete":
+            ok_ad, removed_a = delete_anchor_by_title(uid, atitle or "")
+            if ok_ad and removed_a:
+                await message.answer(
+                    f"Якорь «{removed_a}» снят — как магнит с холодильника, только без скрипа 😌 "
+                    f"Загляни в «покажи якоря», если хочешь проверить список 📋"
+                )
+            else:
+                await message.answer(
+                    "Такого якоря не нашёл — глянь «покажи якоря» или поправь название 🔎"
+                )
+            return
+        if areason == "list":
+            await _send_anchors_list(message, uid)
+            return
+        if areason.startswith("create"):
+            logger.info(
+                "anchor_save: MATCH user_id=%s reason=%s title_hint=%r",
+                uid,
+                areason,
+                atitle,
+            )
+            snippet, msg_ref, draft = build_anchor_snippet_and_ref(uid)
+            if not snippet or msg_ref is None:
+                await message.answer(
+                    "Сейчас нечего метить: в истории ещё нет нашего обмена репликами. "
+                    "Напиши вопрос — я отвечу — и тогда скажи «запомни этот момент» 🎯😊"
+                )
+                return
+            hint = (atitle or "").strip()
+            base_title = hint if hint else auto_title_anchor(snippet, draft)
+            ok_ins, info = insert_anchor(
+                uid, base_title, snippet, msg_ref, config.max_user_anchors
+            )
+            if ok_ins:
+                await message.answer(
+                    f"Готово 🔖 Якорь «{info}» поставил — не потеряем нить. "
+                    f"«Покажи якоря» — и вспомним этот кусок беседы снова ✨"
+                )
+            else:
+                await message.answer(info)
+            return
+
+    del_title = parse_delete_template_title(text)
+    if del_title is not None:
+        if not del_title.strip():
+            await message.answer(
+                "Напиши так: «удали шаблон Название» — и я уберу нужную запись 🗑️"
+            )
+            return
+        ok_del, removed = delete_template_by_title(uid, del_title)
+        if ok_del and removed:
+            await message.answer(
+                f"Удалил шаблон «{removed}» — как снег на голову, только полезнее ❄️ "
+                f"Место в коллекции освободилось!"
+            )
+        else:
+            await message.answer(
+                "Такого шаблона не нашёл — проверь название или открой список: «покажи шаблоны» 🔎"
+            )
+        return
+
+    if looks_like_list_templates_command(text):
+        await _send_templates_list(message, uid)
+        return
+
+    logger.debug(
+        "template_save: проверка user_id=%s len=%s text=%r",
+        uid,
+        len(text),
+        text[:500],
+    )
+    matched_save, save_reason = classify_save_template_command(text)
+    if matched_save:
+        logger.info(
+            "template_save: MATCH user_id=%s reason=%s",
+            uid,
+            save_reason,
+        )
+    else:
+        logger.debug(
+            "template_save: NO_MATCH user_id=%s reason=%s",
+            uid,
+            save_reason,
+        )
+        if "запомни" in (text or "").lower():
+            logger.info(
+                "template_save: NO_MATCH user_id=%s reason=%s (запомни → якоря, не шаблон)",
+                uid,
+                save_reason,
+            )
+
+    if matched_save:
+        last = get_last_assistant_reply(memory, uid)
+        wants_own = user_explicitly_wants_own_message_saved(text)
+        if wants_own and not last:
+            await message.answer(
+                "Я сохраняю свои ответы, а не твои сообщения 😊 "
+                "Сначала задай вопрос → я отвечу → потом скажи «сохрани это»!"
+            )
+            return
+        if not last:
+            await message.answer(
+                "Сейчас нечего класть в шаблоны: в истории ещё нет моего ответа, только твоя реплика. "
+                "Задай вопрос — я отвечу — и тогда нажми «сохрани это» (или «сохрани его») 🎯"
+            )
+            return
+        explicit = extract_save_title(text)
+        base_title = explicit or auto_title_from_content(last or "")
+        ok_ins, info = insert_template(
+            uid, base_title, last or "", config.max_user_templates
+        )
+        if ok_ins:
+            await message.answer(
+                f"Сохранено 📌 Шаблон «{info}» добавлен в твою коллекцию! "
+                f"Потом скажи «покажи шаблоны» — покажу всё кнопками 😊"
+            )
+        else:
+            await message.answer(info)
+        return
+
+    is_scen, scen_topic, scen_params = classify_scenario_request(text)
+    if is_scen:
+        logger.info(
+            "scenario: MATCH user_id=%s topic=%r",
+            uid,
+            scen_topic[:200] if scen_topic else "",
+        )
+        await safe_send_chat_action(bot, message.chat.id, "typing")
+        try:
+            o_blk, r_blk, p_blk, _ = await asyncio.to_thread(
+                generate_scenarios, agent, scen_topic, scen_params
+            )
+        except Exception as exc:
+            logger.exception("scenario: ошибка генерации: %s", exc)
+            await message.answer(
+                "Симулятор споткнулся об нейросеть — попробуй ещё раз чуть позже или переформулируй вопрос 🎲😅"
+            )
+            return
+        intro = format_scenario_intro(scen_topic, o_blk, r_blk, p_blk)
+        sid = put_session(uid, scen_topic, o_blk, r_blk, p_blk, intro)
+        kb = build_scenario_choice_keyboard(sid)
+        memory.save_user_memory(uid, text, intro)
+        await message.answer(intro, reply_markup=kb)
+        return
+
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+    response = agent.process_message_with_agent(
+        user_id=message.from_user.id, user_text=message.text
+    )
+    buttons = resolve_proactive_buttons(
+        message.from_user.id,
+        response.answer,
+        response.buttons,
+        getattr(response, "is_generic", False),
+        user_query=message.text,
+    )
+    await send_ai_reply(message, response.answer, buttons)
+
+
+@router.message(F.document)
+async def document_handler(message: Message, bot: Bot) -> None:
+    if not message.from_user or not message.document:
+        return
+
+    log_user_message(message.from_user.id, message.from_user.username)
+
+    document = message.document
+    mime_type = (document.mime_type or "").lower()
+    if mime_type in {"image/jpeg", "image/png", "image/gif"}:
+        cap = (message.caption or "").strip()
+        question = cap if cap else "Что на этом изображении? Опиши подробно."
+        memory_user_text = (
+            f"[Изображение] {cap}" if cap else "[Изображение] Без подписи — разбор содержимого."
+        )
+        await _handle_image_message(
+            message=message,
+            bot=bot,
+            file_id=document.file_id,
+            question=question,
+            memory_user_text=memory_user_text,
+            default_suffix=".jpg",
+        )
+        return
+
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+    filename = (document.file_name or "").lower()
+    buffer = BytesIO()
+    await bot.download(document, destination=buffer)
+    file_bytes = buffer.getvalue()
+
+    try:
+        if filename.endswith(".pdf"):
+            extracted = extract_text_from_pdf(file_bytes)
+        elif filename.endswith(".txt"):
+            extracted = extract_text_from_txt(file_bytes)
+        else:
+            await message.answer("Поддерживаются только PDF и TXT файлы 🙏")
+            return
+    except Exception as exc:
+        await message.answer(f"Не получилось обработать файл 😥\n{exc}")
+        return
+
+    if not extracted:
+        await message.answer("В файле не найден текст 🤷")
+        return
+
+    prompt = (
+        "Пользователь прислал файл. Ниже извлеченный текст.\n"
+        "Сделай полезный ответ по содержанию:\n\n"
+        f"{extracted[:12000]}"
+    )
+    response = agent.process_message_with_agent(
+        user_id=message.from_user.id,
+        user_text=prompt,
+        allow_clarification=False,
+    )
+    buttons = resolve_proactive_buttons(
+        message.from_user.id,
+        response.answer,
+        response.buttons,
+        getattr(response, "is_generic", False),
+        user_query=None,
+    )
+    await send_ai_reply(message, response.answer, buttons)
+
+
+@router.message(F.photo)
+async def photo_handler(message: Message, bot: Bot) -> None:
+    if not message.from_user or not message.photo:
+        return
+    log_user_message(message.from_user.id, message.from_user.username)
+    best_photo = message.photo[-1]
+    cap = (message.caption or "").strip()
+    question = cap if cap else "Что на этом изображении? Опиши подробно."
+    memory_user_text = (
+        f"[Изображение] {cap}" if cap else "[Изображение] Без подписи — разбор содержимого."
+    )
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+    await _handle_image_message(
+        message=message,
+        bot=bot,
+        file_id=best_photo.file_id,
+        question=question,
+        memory_user_text=memory_user_text,
+        default_suffix=".jpg",
+    )
+
+
+async def _handle_image_message(
+    message: Message,
+    bot: Bot,
+    file_id: str,
+    question: str,
+    memory_user_text: str,
+    default_suffix: str,
+) -> None:
+    temp_file_path = ""
+    try:
+        file_info = await bot.get_file(file_id)
+        guessed_mime, _ = mimetypes.guess_type(file_info.file_path or "")
+        suffix = mimetypes.guess_extension(guessed_mime or "") or default_suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file_path = temp_file.name
+
+        await bot.download_file(file_info.file_path, destination=temp_file_path)
+        with open(temp_file_path, "rb") as image_file:
+            raw = image_file.read()
+        mime_type = guessed_mime or "image/jpeg"
+        image_data_url = f"data:{mime_type};base64,{base64.b64encode(raw).decode('utf-8')}"
+        uid = message.from_user.id if message.from_user else 0
+        img_seq = memory.count_user_image_messages(uid) + 1
+        dialogue_ctx = (
+            memory.build_vision_history_context(uid)
+            if img_seq > 1
+            else None
+        )
+        analysis = agent.analyze_image(
+            image_data_url,
+            question,
+            image_sequence=img_seq,
+            dialogue_context=dialogue_ctx,
+        )
+        fail_text = "Не удалось проанализировать изображение"
+        if message.from_user and analysis.strip() and analysis.strip() != fail_text:
+            memory.save_user_memory(
+                message.from_user.id, memory_user_text, analysis.strip()
+            )
+            logger.info(
+                "История: сохранён ответ по изображению для user_id=%s",
+                message.from_user.id,
+            )
+        buttons = resolve_proactive_buttons(
+            message.from_user.id if message.from_user else 0,
+            analysis,
+            None,
+            True,
+            user_query=question,
+        )
+        await send_ai_reply(message, analysis, buttons)
+    except Exception as exc:
+        logger.exception("Ошибка обработки изображения: %s", exc)
+        await message.answer("Не удалось проанализировать изображение 😥")
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except OSError:
+                pass
+
+
+@router.callback_query(F.data == CALLBACK_START_HELP)
+async def show_help_callback(callback: CallbackQuery) -> None:
+    if callback.message:
+        adm = is_admin(callback.from_user.id) if callback.from_user else False
+        await reply_with_help_text(callback.message, is_admin_override=adm)
+    await callback.answer()
+
+
+@router.message(F.voice)
+async def voice_handler(message: Message, bot: Bot) -> None:
+    if not message.from_user or not message.voice:
+        return
+
+    log_user_message(message.from_user.id, message.from_user.username)
+
+    user_id = message.from_user.id
+    logger.info("Голосовое сообщение: %s секунд", message.voice.duration)
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+
+    temp_file_path = ""
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_file:
+            temp_file_path = temp_file.name
+
+        await bot.download_file(file.file_path, destination=temp_file_path)
+        voice_text = agent.transcribe_voice(temp_file_path)
+        if not voice_text:
+            await message.answer("Не удалось распознать голосовое 😥 Попробуй отправить еще раз.")
+            return
+
+        response = agent.process_message_with_agent(user_id=user_id, user_text=voice_text)
+        buttons = resolve_proactive_buttons(
+            user_id,
+            response.answer,
+            response.buttons,
+            getattr(response, "is_generic", False),
+            user_query=voice_text,
+        )
+        await send_ai_reply(message, response.answer, buttons)
+    except Exception as exc:
+        logger.exception("Ошибка обработки голосового: %s", exc)
+        await message.answer("Не удалось обработать голосовое сообщение 😥")
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except OSError:
+                pass
+
+
+@router.callback_query()
+async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.message or not callback.from_user:
+        return
+
+    user_id = callback.from_user.id
+    data = callback.data or ""
+    logger.info("Callback received: %s", data)
+
+    await callback.answer()
+
+    await safe_send_chat_action(bot, callback.message.chat.id, "typing")
+
+    if is_anchor_callback(data):
+        kind, aid = parse_anchor_callback(data)
+        if kind == "list":
+            await _send_anchors_list(callback.message, user_id)
+            return
+        if kind == "open" and aid is not None:
+            row = get_anchor(user_id, aid)
+            if not row:
+                await callback.message.answer(
+                    "Этот якорь уже не найден — возможно, сняли или протухла кнопка 🌊"
+                )
+                return
+            body = format_anchor_message(row)
+            if len(body) > 4096:
+                body = body[:4080] + "\n…"
+            await callback.message.answer(
+                body,
+                reply_markup=build_anchor_view_keyboard(aid),
+            )
+            return
+        if kind == "delete" and aid is not None:
+            ok_del_a, removed_a = delete_anchor_by_id(user_id, aid)
+            if ok_del_a and removed_a:
+                await callback.message.answer(
+                    f"Убрал якорь «{removed_a}» 🗑️ Если нужно — загляни в «покажи якоря» или поставь новый 🔖"
+                )
+            else:
+                await callback.message.answer(
+                    "Не нашёл этот якорь — может, уже стёрли. Обнови список 📋"
+                )
+            return
+        return
+
+    if is_scenario_callback(data):
+        act, sid = parse_scenario_callback(data)
+        if not act or not sid:
+            await callback.message.answer("Кнопка устарела — начни новый «что если…» в чате 🎲")
+            return
+        sess = get_session(user_id, sid)
+        if not sess:
+            await callback.message.answer(
+                "Сессия сценариев уже сдулась (они живут недолго) — напиши вопрос заново, я снова накатаю три ветки 🎈"
+            )
+            return
+        if act == "b":
+            await callback.message.answer(
+                sess.intro_text,
+                reply_markup=build_scenario_choice_keyboard(sid),
+            )
+            return
+        if act == "s":
+            await callback.message.answer(
+                "Чтобы шаблон попал в коллекцию: после любого моего ответа напиши «сохрани это» "
+                "или «сохрани как Название» — утащу последний ответ бота в шаблоны 📌😊"
+            )
+            return
+        if act == "n":
+            await callback.message.answer(
+                "Окей, ловлю следующий вопрос — пиши в чат, развернём новую тему 💬✨"
+            )
+            return
+        if act in ("o", "r", "p"):
+            block = {"o": sess.optimist, "r": sess.realist, "p": sess.pessimist}[act]
+            label = {
+                "o": "оптимистичный 🟢",
+                "r": "реалистичный 🟡",
+                "p": "пессимистичный 🔴",
+            }[act]
+            try:
+                expanded = await asyncio.to_thread(
+                    run_scenario_expand,
+                    agent,
+                    sess.original,
+                    label,
+                    block,
+                )
+            except Exception as exc:
+                logger.exception("scenario: углубление: %s", exc)
+                await callback.message.answer(
+                    "Не вышло развернуть сценарий — сеть капризничает. Попробуй нажать кнопку ещё раз 🔁"
+                )
+                return
+            if len(expanded) > 4096:
+                expanded = expanded[:4070] + "\n…"
+            memory.save_user_memory(
+                user_id,
+                f"Разбор сценария: {label}",
+                expanded,
+            )
+            await callback.message.answer(
+                expanded,
+                reply_markup=build_scenario_deep_keyboard(sid),
+            )
+        return
+
+    if is_editor_callback(data):
+        act, did = parse_editor_callback(data)
+        if not act or did is None:
+            await callback.message.answer("Кнопка протухла — набери /drafts, сделаем свежую ✍️")
+            return
+        if not is_private_chat(callback.message):
+            await callback.message.answer(
+                "Черновики и апрув — только в личке со мной, иначе кнопки теряются в толпе 💬"
+            )
+            return
+        row = get_draft(user_id, did)
+        if not row or str(row.get("status")) != "draft":
+            await callback.message.answer("Этот черновик уже не ждёт решения — /drafts для новой заготовки 📋")
+            return
+        ch_id = int(str(row["channel_id"]))
+        body = str(row.get("content") or "")
+        if act == "a":
+            try:
+                await bot.send_message(
+                    chat_id=ch_id,
+                    text=body,
+                    disable_web_page_preview=False,
+                )
+            except TelegramBadRequest as exc:
+                logger.warning("editor: публикация в канал: %s", exc)
+                set_draft_status(user_id, did, "failed")
+                await callback.message.answer(
+                    f"Не вышло запостить в канал: {exc}. Проверь права бота (публикация сообщений) и id канала ✍️"
+                )
+                return
+            set_draft_status(user_id, did, "posted", set_approved_at=True)
+            bump_approve(memory, user_id)
+            await callback.message.answer(
+                "Пост улетел в @kriptogeograph — ты на режиссёре, я на суфлёре 🎬✅"
+            )
+            return
+        if act == "r":
+            set_draft_status(user_id, did, "rejected")
+            append_reject_hint(memory, user_id, hint_for_reject_from_draft(row))
+            await callback.message.answer(
+                "Записал отказ в мою «чёрную маленькую тетрадь» подбора — в следующий раз уйду чуть в сторону 📝❌"
+            )
+            return
+        if act == "e":
+            set_pending_edit(user_id, did)
+            await callback.message.answer(
+                "Жду новый текст одним сообщением (без /команд) — подменю черновик и снова дам кнопки ✏️👇"
+            )
+            return
+        return
+
+    if is_template_callback(data):
+        kind, tid = parse_template_callback(data)
+        if kind == "list":
+            await _send_templates_list(callback.message, user_id)
+            return
+        if kind == "open" and tid is not None:
+            row = get_template(user_id, tid)
+            if not row:
+                await callback.message.answer(
+                    "Этот шаблон уже не найден — возможно, удалили или устарела кнопка 🤷"
+                )
+                return
+            title = str(row["title"])
+            body = format_template_body(str(row["content"]))
+            header = f"Вот «{title}» — сохранённый ответ:\n\n"
+            if len(header) + len(body) > 4096:
+                body = body[: 4096 - len(header) - 30] + "\n…"
+            await callback.message.answer(
+                header + body,
+                reply_markup=build_template_view_keyboard(int(row["id"])),
+            )
+            return
+        if kind == "delete" and tid is not None:
+            ok_del, removed_title = delete_template_by_id(user_id, tid)
+            if ok_del and removed_title:
+                await callback.message.answer(
+                    f"Готово 🗑️ Шаблон «{removed_title}» удалён. "
+                    f"Если нужно — загляни в «покажи шаблоны» или жми «Ещё шаблоны» под следующей записью."
+                )
+            else:
+                await callback.message.answer(
+                    "Не нашёл этот шаблон — возможно, его уже стёрли. Обнови список 📋"
+                )
+            return
+        return
+
+    if data == "concierge_run":
+        if not agent.concierge_enabled:
+            await callback.message.answer("Режим консьержа сейчас выключен ⚙️")
+            return
+        history = memory.get(user_id)
+        last_user_message = next(
+            (m["content"] for m in reversed(history) if m["role"] == "user"), ""
+        )
+        query = agent.consume_pending_concierge(user_id) or (last_user_message or "").strip()
+        if not query or query.startswith("Пользователь нажал кнопку"):
+            query = last_user_message
+        if not query:
+            await callback.message.answer("Не пойму, по чему искать — напиши запрос текстом 🔎")
+            return
+        search_result = agent.search_with_tavily(query[:400])
+        logger.info("Консьерж: Tavily для user_id=%s", user_id)
+        response = agent.process_message_with_agent(
+            user_id=user_id,
+            user_text=(
+                "Пользователь нажал кнопку «да, помоги действием» (консьерж). "
+                f"Исходный запрос для поиска: {query}\n\n"
+                f"Результаты веб-поиска:\n{search_result}\n\n"
+                "Собери конкретный полезный ответ: варианты, факты, ссылки в скобках как в правилах. "
+                "Если поиск недоступен, пуст или только заглушка — честно скажи и предложи уточнить город, даты, бюджет "
+                "или включить веб-поиск в настройках. Стиль Кузьмы."
+            ),
+            skip_concierge_tracking=True,
+        )
+        logger.info("Отправляю ответ пользователю")
+        buttons = resolve_proactive_buttons(
+            user_id,
+            response.answer,
+            response.buttons,
+            getattr(response, "is_generic", False),
+            user_query=query or None,
+        )
+        await send_ai_reply(callback.message, response.answer, buttons)
+    elif data in {"web_search", "latest_updates"}:
+        history = memory.get(user_id)
+        last_user_message = next(
+            (m["content"] for m in reversed(history) if m["role"] == "user"), ""
+        )
+        if not last_user_message:
+            logger.info("Отправляю ответ пользователю")
+            await callback.message.answer("Пока нет текста для поиска 🌐")
+        else:
+            if data == "latest_updates":
+                query = f"свежие последние новости: {last_user_message[:260]}"
+            else:
+                query = last_user_message[:300]
+            search_result = agent.web_search(query)
+            logger.info("Callback: запускаю агента")
+            response = agent.process_message_with_agent(
+                user_id=user_id,
+                user_text=f"Используй результаты веб-поиска и ответь пользователю:\n{search_result}",
+                skip_concierge_tracking=True,
+            )
+            logger.info("Callback: агент вернул ответ")
+            logger.info("Отправляю ответ пользователю")
+            buttons = resolve_proactive_buttons(
+                user_id,
+                response.answer,
+                response.buttons,
+                getattr(response, "is_generic", False),
+                user_query=last_user_message or None,
+            )
+            await send_ai_reply(callback.message, response.answer, buttons)
+    elif data == "clear_history":
+        memory.clear_user_memory(user_id)
+        agent.clear_clarification_pending(user_id)
+        logger.info("Отправляю ответ пользователю")
+        await callback.message.answer("История диалога очищена 🗑️ Начнем заново?")
+    else:
+        logger.info("Callback: запускаю агента")
+        response = agent.process_message_with_agent(
+            user_id=user_id,
+            user_text=f"Пользователь нажал кнопку: {data}. Продолжи диалог на основе контекста.",
+            skip_concierge_tracking=True,
+        )
+        logger.info("Callback: агент вернул ответ")
+        logger.info("Отправляю ответ пользователю")
+        buttons = resolve_proactive_buttons(
+            user_id,
+            response.answer,
+            response.buttons,
+            getattr(response, "is_generic", False),
+            user_query=None,
+        )
+        await send_ai_reply(callback.message, response.answer, buttons)
+
+
+async def main() -> None:
+    logger.info("Запуск бота, PID=%s", os.getpid())
+    init_db()
+    logger.info("База данных инициализирована: bot_database.db")
+    init_stats_db()
+    logger.info("База статистики инициализирована: bot_statistics.db")
+    init_admin_db()
+    logger.info("Админка: таблица банов готова (bot_statistics.db)")
+    telegram_session = build_telegram_session()
+    if telegram_session:
+        bot = Bot(token=config.telegram_token, session=telegram_session)
+    else:
+        bot = Bot(token=config.telegram_token)
+
+    dp = Dispatcher()
+    dp.message.middleware(BanCheckMiddleware())
+    dp.message.middleware(AdminAuthMiddleware())
+    dp.include_router(router)
+    try:
+        await bot.get_me()
+        await setup_bot_command_menu(bot, config.admin_id)
+    except TelegramConflictError:
+        logger.warning("Другая копия бота уже запущена")
+        await bot.session.close()
+        agent.close()
+        return
+
+    autofetch_task = asyncio.create_task(
+        run_content_editor_autofetch_loop(bot, agent, memory)
+    )
+    logger.info(
+        "Auto-search: background task scheduled (task=%r)",
+        autofetch_task,
+    )
+    try:
+        await dp.start_polling(bot)
+    finally:
+        autofetch_task.cancel()
+        try:
+            await autofetch_task
+        except asyncio.CancelledError:
+            pass
+        agent.close()
+        await bot.session.close()
+        logger.info("Бот остановлен корректно")
+
+
+def _match_fallback_branch(answer_text: str) -> tuple[list[dict[str, str]], str]:
+    """Эвристика по одному фрагменту текста (ответ бота или текущий запрос пользователя)."""
+    text = answer_text.lower()
+
+    def hit(branch: str, buttons: list[dict[str, str]]) -> tuple[list[dict[str, str]], str]:
+        logger.info("Fallback: сработали ключевые слова → ветка %s", branch)
+        return buttons, branch
+
+    if any(
+        w in text
+        for w in (
+            "трансмисс",
+            "кпп",
+            "коробк передач",
+            "сцеплен",
+            "редуктор",
+            "кардан",
+            "суппорт",
+            "привод",
+            "дифференциал",
+        )
+    ) or (
+        "передач" in text
+        and any(x in text for x in ("коробк", "авто", "машин", "механизм", "ведущ"))
+    ):
+        return hit(
+            "auto_drivetrain",
+            [
+                {"text": "Устройство по шагам ⚙️", "callback_data": "ask_followup"},
+                {"text": "Типы и отличия 🔄", "callback_data": "ask_followup"},
+                {"text": "Обслуживание и неисправности 🛠️", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in (
+            "телеграм",
+            "telegram",
+            "aiogram",
+            "айограм",
+            "чат-бот",
+            "чатбот",
+            "телеграм-бот",
+            "python-telegram-bot",
+            "pytelegrambot",
+        )
+    ):
+        return hit(
+            "tech_dev",
+            [
+                {"text": "Код и структура 💻", "callback_data": "ask_followup"},
+                {"text": "Библиотеки и API 📚", "callback_data": "ask_followup"},
+                {"text": "Тестирование и запуск 🧪", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in (
+            "авиабилет",
+            "перелёт",
+            "перелет",
+            "аэропорт",
+            "рейс",
+            "самолёт",
+            "самолет",
+            "багаж",
+            "регистрац",
+        )
+    ):
+        return hit(
+            "flights",
+            [
+                {"text": "Как выбрать рейс ✈️", "callback_data": "ask_followup"},
+                {"text": "Цены и даты 💳", "callback_data": "ask_followup"},
+                {"text": "Багаж и регистрация 🧳", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(w in text for w in ("егэ", "огэ")):
+        return hit(
+            "exam_prep",
+            [
+                {"text": "План подготовки 📅", "callback_data": "ask_followup"},
+                {"text": "Ресурсы и материалы 📚", "callback_data": "ask_followup"},
+                {"text": "Мотивация и режим 💪", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in (
+            "дамли",
+            "дампли",
+            "пельмен",
+            "момо",
+            "вонтон",
+            "гёдза",
+            "баоцз",
+            "мант",
+        )
+    ):
+        return hit(
+            "dumplings",
+            [
+                {"text": "Ингредиенты теста и начинки 🥟", "callback_data": "ask_followup"},
+                {"text": "Лепка и варка по шагам 📋", "callback_data": "ask_followup"},
+                {"text": "Соусы и подача 🍶", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if bool(re.search(r"\bэффект\b", text)) or any(
+        w in text
+        for w in (
+            "физическ",
+            "квантов",
+            "термодинам",
+            "электромагнит",
+            "оптическ",
+            "релятивист",
+            "интерференц",
+            "дифракц",
+            "поляризац",
+            "фотон",
+            "электрон",
+        )
+    ):
+        return hit(
+            "physics",
+            [
+                {"text": "Где применяется 🔬", "callback_data": "ask_followup"},
+                {"text": "Детали и суть 📐", "callback_data": "ask_followup"},
+                {"text": "Похожие эффекты 🧪", "callback_data": "ask_followup"},
+            ],
+        )
+
+    cooking_gotovk = bool(re.search(r"(?<!под)готовк", text))
+    food_kw = any(
+        w in text
+        for w in (
+            "приготовить",
+            "рецепт",
+            "блюд",
+            "кулинар",
+            "борщ",
+            "запек",
+            "туш",
+            "жарен",
+        )
+    )
+    soup_word = bool(re.search(r"(?<!супп)\bсуп\b", text))
+    if food_kw or cooking_gotovk or soup_word:
+        return hit(
+            "food",
+            [
+                {"text": "Ингредиенты 🥕", "callback_data": "ask_followup"},
+                {"text": "Пошагово 📋", "callback_data": "ask_followup"},
+                {"text": "Время и нюансы ⏱️", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in (
+            "отпуск",
+            "путешеств",
+            "поехать",
+            "туризм",
+            "курорт",
+            "отдых",
+            "виза",
+            "поезд",
+            "электричк",
+            "плацкарт",
+            "купе",
+            "вагон",
+            "железнодорож",
+            "ржд",
+            "ж/д",
+        )
+    ):
+        return hit(
+            "travel",
+            [
+                {"text": "Маршрут и билеты 🎫", "callback_data": "ask_followup"},
+                {"text": "Комфорт в пути 🧳", "callback_data": "ask_followup"},
+                {"text": "Сравнить с другим транспортом 🔄", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in (
+            "носки",
+            "носках",
+            "перчатк",
+            "варежк",
+            "одежд",
+            "обув",
+            "аксессуар",
+        )
+    ) or (
+        "размер" in text
+        and any(w in text for w in ("перчатк", "обув", "одежд", "куртк"))
+    ):
+        return hit(
+            "clothing",
+            [
+                {"text": "Материалы и уход 🧵", "callback_data": "ask_followup"},
+                {"text": "Как подобрать размер 📏", "callback_data": "ask_followup"},
+                {"text": "Где купить 🛒", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in ("биткоин", "крипт", "блокчейн", "инвест", "акци", "трейд", "бирж")
+    ):
+        return hit(
+            "crypto_finance",
+            [
+                {"text": "Курс и динамика 📊", "callback_data": "ask_followup"},
+                {"text": "Как купить безопасно 💱", "callback_data": "ask_followup"},
+                {"text": "Риски и хранение ⚠️", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in ("двигатель", "автомобил", "машин", "тормоз", "подвеск", "аккумулятор")
+    ):
+        return hit(
+            "auto_general",
+            [
+                {"text": "Принцип работы ⚙️", "callback_data": "ask_followup"},
+                {"text": "Детали и узлы 🔩", "callback_data": "ask_followup"},
+                {"text": "Обслуживание 🛠️", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in (
+            "выучить",
+            "изучить",
+            "научиться",
+            "урок",
+            "образование",
+            "обучен",
+            "лекци",
+        )
+    ) or (
+        "курс" in text
+        and any(w in text for w in ("онлайн", "школ", "универс", "язык", "программ"))
+    ) or (
+        "подготовк" in text
+        and "экзамен" in text
+        and "егэ" not in text
+        and "огэ" not in text
+    ):
+        return hit(
+            "education",
+            [
+                {"text": "С чего начать 🚀", "callback_data": "ask_followup"},
+                {"text": "Сроки и план ⏱️", "callback_data": "ask_followup"},
+                {"text": "Бесплатные ресурсы 🆓", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(
+        w in text
+        for w in (
+            "теорема",
+            "формула",
+            "математик",
+            "уравнен",
+            "доказательств",
+            "геометр",
+            "алгебр",
+            "пифагор",
+        )
+    ):
+        return hit(
+            "math_science",
+            [
+                {"text": "Примеры задач 📐", "callback_data": "ask_followup"},
+                {"text": "Как применить 🔧", "callback_data": "ask_followup"},
+                {"text": "История и идея 🕰️", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(w in text for w in ("пошагово", "инструкц", "алгоритм", "последовательно")):
+        return hit(
+            "howto_general",
+            [
+                {"text": "Что понадобится 🔧", "callback_data": "ask_followup"},
+                {"text": "Частые ошибки ⚠️", "callback_data": "ask_followup"},
+                {"text": "Альтернативные способы 🔄", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(w in text for w in ("сравнить", "лучше", "разница", "отличие", "выбрать", "какой из")):
+        return hit(
+            "compare",
+            [
+                {"text": "Плюсы и минусы ⚖️", "callback_data": "ask_followup"},
+                {"text": "Критерии выбора 📋", "callback_data": "ask_followup"},
+                {"text": "Что взять в твоём случае 🎯", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(w in text for w in ("что такое", "это значит", "принцип", "объясни", "устроен")):
+        return hit(
+            "explain",
+            [
+                {"text": "Простыми словами ещё раз 💡", "callback_data": "ask_followup"},
+                {"text": "Пример из практики 📚", "callback_data": "ask_followup"},
+                {"text": "Что может пойти не так ⚠️", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(w in text for w in ("совет", "рекоменд", "стоит ли", "предлага")):
+        return hit(
+            "advice",
+            [
+                {"text": "Альтернативы 🔄", "callback_data": "ask_followup"},
+                {"text": "План действий 🚀", "callback_data": "ask_followup"},
+                {"text": "Экономия и лайфхаки 💡", "callback_data": "ask_followup"},
+            ],
+        )
+
+    if any(w in text for w in ("цена", "стоим", "дорог", "дёшев", "бюджет", "платн")):
+        return hit(
+            "price",
+            [
+                {"text": "Где выгоднее 🛒", "callback_data": "ask_followup"},
+                {"text": "Как сэкономить 💡", "callback_data": "ask_followup"},
+                {"text": "Окупается ли 🤔", "callback_data": "ask_followup"},
+            ],
+        )
+
+    return hit(
+        "default",
+        [
+            {"text": "Развить тему дальше 💬", "callback_data": "ask_followup"},
+            {"text": "Другой угол вопроса 🔄", "callback_data": "ask_followup"},
+            {"text": "Помощь /help 🙌", "callback_data": "need_help"},
+        ],
+    )
+
+
+def generate_context_buttons_fallback(
+    answer_text: str,
+    user_query: str | None = None,
+) -> tuple[list[dict[str, str]], str]:
+    """Кнопки по ответу бота; тема текущего запроса переопределяет ложные совпадения из «эха» в ответе."""
+    q = user_query or ""
+    a = answer_text or ""
+    logger.info(
+        "fallback: query='%s', answer='%s'",
+        q[:50] + ("..." if len(q) > 50 else ""),
+        a[:50] + ("..." if len(a) > 50 else ""),
+    )
+    ab, ba = _match_fallback_branch(answer_text)
+    uq = (user_query or "").strip()
+    if not uq:
+        return ab, ba
+    ub, bu = _match_fallback_branch(uq)
+    if bu != "default" and (bu != ba or ba == "default"):
+        logger.info(
+            "Fallback: приоритет темы текущего запроса (ветка %s) над эвристикой ответа (ветка %s)",
+            bu,
+            ba,
+        )
+        return ub, bu
+    return ab, ba
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
