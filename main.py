@@ -112,7 +112,6 @@ from app.statistics import (
 from app.llm_agent import LLMAgent
 from app.memory import ChatMemory
 from app.proxy_utils import (
-    socks5_proxy_url_from_config,
     telegram_socks5_proxy_url_from_config,
 )
 from app.pdf_extractor import extract_text_from_pdf, extract_text_from_txt

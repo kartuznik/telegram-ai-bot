@@ -289,10 +289,6 @@ def classify_save_template_command(text: str) -> tuple[bool, str]:
     return False, "no_fixed_phrase"
 
 
-def looks_like_save_template_command(text: str) -> bool:
-    return classify_save_template_command(text)[0]
-
-
 def looks_like_list_templates_command(text: str) -> bool:
     t = _norm(text)
     if not t:
@@ -387,19 +383,6 @@ def _unique_title(conn, user_id: int, base: str) -> str:
         n += 1
         if n > 500:
             return base[: MAX_TITLE_LEN - 20] + " (копия)"
-
-
-def count_templates(user_id: int) -> int:
-    try:
-        with get_connection() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS c FROM user_templates WHERE user_id=?",
-                (str(user_id),),
-            ).fetchone()
-        return int(row["c"]) if row else 0
-    except Exception as exc:
-        logger.exception("user_templates count: %s", exc)
-        return 0
 
 
 def list_template_rows(user_id: int) -> list[dict]:

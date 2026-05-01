@@ -102,7 +102,6 @@ _TG_DEFAULT_USERNAMES: list[str] = [
 CB_APPROVE = "a"
 CB_EDIT = "e"
 CB_REJECT = "r"
-CALLBACK_PREFIX = "editor:"
 
 _pending_edit: dict[int, int] = {}
 
@@ -436,10 +435,6 @@ def get_source_mode(prefs: dict[str, str]) -> str:
 
 def editor_needs_tavily(prefs: dict[str, str]) -> bool:
     return get_source_mode(prefs) in ("web", "both")
-
-
-def editor_needs_telegram_feed(prefs: dict[str, str]) -> bool:
-    return get_source_mode(prefs) in ("tg", "both")
 
 
 def _parse_username_csv(raw: str) -> list[str]:

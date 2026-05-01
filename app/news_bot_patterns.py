@@ -294,7 +294,3 @@ def score_text(text: str) -> dict[str, int]:
     scored = {category: len(hits) for category, hits in matched.items() if hits}
     sorted_items = sorted(scored.items(), key=lambda x: x[1], reverse=True)
     return dict(sorted_items)
-
-
-def is_relevant(text: str) -> bool:
-    return bool(score_text(text))
