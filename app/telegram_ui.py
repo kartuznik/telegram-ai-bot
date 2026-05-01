@@ -30,6 +30,7 @@ def build_user_bot_commands() -> list[BotCommand]:
         BotCommand(command="editor_stop", description="Выключить редактор"),
         BotCommand(command="editor_prefs", description="Настройки редактора"),
         BotCommand(command="editor_info", description="Текущие настройки редактора"),
+        BotCommand(command="editor_rules", description="Правила редактора для черновиков"),
         BotCommand(command="editor_reset_rejects", description="Сброс отказов и банов каналов"),
         BotCommand(command="drafts", description="Черновики постов для канала"),
         BotCommand(command="bookmarks", description="Якоря в диалоге"),
@@ -153,7 +154,8 @@ _HELP_MIDDLE = (
     "• /editor_prefs тгканалы:@a,@b или /editor_prefs тгканалы @a @b — только список TG-каналов (опечатка «тканалы:»)\n"
     "• /editor_prefs биткоин,defi — по-прежнему можно одной строкой без слова «темы»\n"
     "• /editor_prefs источники:both — web (Tavily), tg (t.me/s), both (по умолчанию both); для web нужен TAVILY_API_KEY\n"
-    "• /editor_info — сводка настроек; /editor_reset_rejects — сброс отказов и жёстких банов по сайту или tg:каналу\n"
+    "• /editor_info — сводка настроек; /editor_rules — накопленные правила для генерации черновиков; "
+    "/editor_reset_rejects — сброс отказов и жёстких банов по сайту или tg:каналу\n"
     "• /editor_prefs авто:0.5 — авто-поиск черновиков примерно раз в 30 минут (также можно авто:1, авто:24 и т.д. до 168); "
     "авто:off — только ручной /drafts\n"
     "• /drafts — очередь черновиков: покажу самый старый на решение; пусто — подберу новый; "

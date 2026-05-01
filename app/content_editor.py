@@ -12,7 +12,14 @@ from urllib.parse import urlparse
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.config import Config
-from app.database import get_connection
+from app.database import (
+    get_connection,
+    get_draft_feedback_slice,
+    get_editorial_feedbacks_baseline,
+    get_editorial_rules,
+    get_feedbacks_count,
+    save_editorial_rules,
+)
 from app.llm_agent import LLMAgent
 from app.memory import ChatMemory
 from app.statistics import get_channel_quality_snapshot, get_channel_quality_top_bottom
@@ -181,6 +188,7 @@ CB_EDIT = "e"
 CB_REJECT = "r"
 
 _pending_edit: dict[int, int] = {}
+_pending_feedback: dict[int, dict[str, Any]] = {}
 
 DRAFT_SYSTEM = (
     "Ты — Кузьма, редактор коротких постов для Telegram-канала @kriptogeograph. "
@@ -627,6 +635,25 @@ def build_voice_examples_overlay(user_id: int, limit: int = 3) -> str:
     )
 
 
+_MAX_RULES_OVERLAY_CHARS = 3200
+
+
+def build_editorial_rules_overlay(user_id: int) -> str:
+    """Текст для system prompt: дистиллированные пожелания редактора из БД (пусто, если ещё нет)."""
+    raw = get_editorial_rules(user_id)
+    if not raw:
+        return ""
+    t = raw.strip()
+    if not t:
+        return ""
+    if len(t) > _MAX_RULES_OVERLAY_CHARS:
+        t = t[: _MAX_RULES_OVERLAY_CHARS - 1] + "…"
+    return (
+        "\nУстойчивые пожелания редактора (учитывай в тоне и структуре поста; не цитируй список дословно):\n"
+        f"{t}\n"
+    )
+
+
 def format_editor_info_text(prefs: dict[str, str], *, user_id: int | None = None) -> str:
     """Текст для /editor_info — сводка prefs редактора."""
     sm = get_source_mode(prefs)
@@ -1049,6 +1076,109 @@ def pop_pending_edit(user_id: int) -> int | None:
 
 def get_pending_edit(user_id: int) -> int | None:
     return _pending_edit.get(user_id)
+
+
+def set_pending_feedback(
+    user_id: int,
+    draft_id: int | None,
+    action: str,
+    draft_preview: str,
+) -> None:
+    """Ожидание свободного ответа пользователя на вопрос после ✅/❌/✏️."""
+    _pending_feedback[user_id] = {
+        "draft_id": draft_id,
+        "action": (action or "").strip().lower(),
+        "draft_preview": (draft_preview or "")[:100],
+    }
+
+
+def get_pending_feedback(user_id: int) -> dict[str, Any] | None:
+    return _pending_feedback.get(user_id)
+
+
+def pop_pending_feedback(user_id: int) -> dict[str, Any] | None:
+    return _pending_feedback.pop(user_id, None)
+
+
+EDITORIAL_DISTILL_EVERY = 5
+
+_EDITORIAL_DISTILL_SYSTEM = (
+    "Ты помогаешь редактору крипто-канала. По пакету его коротких комментариев к решениям по черновикам "
+    "нужно обновить список устойчивых редакторских предпочтений для будущих постов.\n"
+    "Формат: маркированный список на русском, без воды и повторов, конкретно про тон, угол, табу и акценты.\n"
+    "Если даны старые правила — объедини с новым смыслом, убери дубли и явные противоречия (новые факты из батча важнее).\n"
+    "Не больше ~2000 символов. Только список, без вступлений и без подписи."
+)
+
+
+def maybe_distill_editorial_rules_sync(agent: LLMAgent, user_id: int) -> None:
+    """Каждые EDITORIAL_DISTILL_EVERY новых фидбеков — пересобрать rules_text в SQLite. При сбое GPT — только WARNING."""
+    baseline = get_editorial_feedbacks_baseline(user_id)
+    total = get_feedbacks_count(user_id)
+    if total - baseline < EDITORIAL_DISTILL_EVERY:
+        return
+
+    batch = get_draft_feedback_slice(
+        user_id, offset=baseline, limit=EDITORIAL_DISTILL_EVERY
+    )
+    if len(batch) < EDITORIAL_DISTILL_EVERY:
+        logger.warning(
+            "editorial_distill: ожидалось %s строк, получено %s (user_id=%s baseline=%s total=%s)",
+            EDITORIAL_DISTILL_EVERY,
+            len(batch),
+            user_id,
+            baseline,
+            total,
+        )
+        return
+
+    lines: list[str] = []
+    for i, r in enumerate(batch, start=1):
+        act = str(r.get("action") or "")
+        prev = str(r.get("draft_preview") or "").replace("\n", " ").strip()
+        fb = str(r.get("feedback_text") or "").replace("\n", " ").strip()
+        lines.append(
+            f"{i}. Действие: {act}. Фрагмент черновика: {prev[:180]}. Комментарий: {fb[:600]}"
+        )
+
+    prior = (get_editorial_rules(user_id) or "").strip()
+    prior_block = prior if prior else "(пока нет — составь с нуля по этому батчу)"
+
+    user_payload = (
+        "Текущие правила:\n"
+        f"{prior_block}\n\n"
+        f"Новые {EDITORIAL_DISTILL_EVERY} пояснений редактора:\n"
+        + "\n".join(lines)
+        + "\n\nОбнови правила одним списком."
+    )
+
+    try:
+        out = agent.run_raw_completion(
+            system=_EDITORIAL_DISTILL_SYSTEM,
+            user=user_payload,
+            temperature=0.25,
+            max_tokens=1200,
+        )
+    except Exception as exc:
+        logger.warning("editorial_distill: GPT ошибка user_id=%s: %s", user_id, exc)
+        return
+
+    rules = (out or "").strip()
+    if not rules:
+        logger.warning("editorial_distill: пустой ответ модели user_id=%s", user_id)
+        return
+
+    new_baseline = baseline + EDITORIAL_DISTILL_EVERY
+    if not save_editorial_rules(user_id, rules, new_baseline):
+        logger.warning("editorial_distill: не удалось сохранить в БД user_id=%s", user_id)
+        return
+
+    logger.info(
+        "editorial_distill: правила обновлены user_id=%s baseline %s → %s",
+        user_id,
+        baseline,
+        new_baseline,
+    )
 
 
 def is_private_chat(message: Any) -> bool:
@@ -1848,6 +1978,7 @@ def draft_post_from_snippet(
         finance_overlay = DRAFT_FINANCE_OVERLAY
         logger.debug("Draft: включён финансовый дисклеймер (тема/сниппет похожи на рынок или вложения)")
     voice_overlay = build_voice_examples_overlay(user_id, limit=3)
+    rules_overlay = build_editorial_rules_overlay(user_id)
     approved_n = _approved_posts_count(user_id)
     if approved_n >= 10:
         logger.info("editor_voice: user_id=%s voice сформирован (%s+ апрувов)", user_id, approved_n)
@@ -1858,7 +1989,7 @@ def draft_post_from_snippet(
         f"URL: {url}\n"
     )
     raw = agent.run_raw_completion(
-        system=DRAFT_SYSTEM + tg_overlay + finance_overlay + voice_overlay,
+        system=DRAFT_SYSTEM + tg_overlay + finance_overlay + voice_overlay + rules_overlay,
         user=user_block,
         max_tokens=1200,
         temperature=min(0.82, getattr(agent, "_chat_temperature", 0.75) + 0.05),

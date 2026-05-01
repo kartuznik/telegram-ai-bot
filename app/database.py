@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import logging
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 
 logger = logging.getLogger(__name__)
@@ -117,6 +120,193 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_draft_posts_user_status "
                 "ON draft_posts(user_id, status)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS draft_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    draft_id INTEGER,
+                    action TEXT NOT NULL,
+                    draft_preview TEXT,
+                    feedback_text TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_draft_feedback_user_id "
+                "ON draft_feedback(user_id)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS editorial_rules (
+                    user_id TEXT PRIMARY KEY,
+                    rules_text TEXT,
+                    feedbacks_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             conn.commit()
     except Exception as exc:
         logger.exception("SQLite ошибка: %s", exc)
+
+
+def _uid_str(user_id: int | str) -> str:
+    return str(int(user_id))
+
+
+def save_draft_feedback(
+    user_id: int | str,
+    draft_id: int | None,
+    action: str,
+    draft_preview: str,
+    feedback_text: str,
+) -> int | None:
+    """Сохраняет ответ пользователя на вопрос после решения по черновику. Возвращает id строки или None."""
+    uid = _uid_str(user_id)
+    act = (action or "").strip().lower()
+    if act not in ("approved", "rejected", "edited"):
+        logger.warning("save_draft_feedback: неизвестный action=%r user_id=%s", action, uid)
+        return None
+    prev = (draft_preview or "")[:100]
+    text = feedback_text or ""
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO draft_feedback (user_id, draft_id, action, draft_preview, feedback_text)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (uid, draft_id, act, prev, text),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+    except Exception as exc:
+        logger.exception("save_draft_feedback: %s", exc)
+        return None
+
+
+def get_pending_feedbacks(user_id: int | str, since_last_count: int) -> list[dict[str, Any]]:
+    """
+    Последние фидбеки пользователя (новые сверху), с OFFSET since_last_count.
+    До 20 строк — удобно для дистилляции правил.
+    """
+    uid = _uid_str(user_id)
+    off = max(0, int(since_last_count))
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, user_id, draft_id, action, draft_preview, feedback_text, created_at
+                FROM draft_feedback
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT 20 OFFSET ?
+                """,
+                (uid, off),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.exception("get_pending_feedbacks: %s", exc)
+        return []
+
+
+def get_editorial_rules(user_id: int | str) -> str | None:
+    uid = _uid_str(user_id)
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT rules_text FROM editorial_rules WHERE user_id=?",
+                (uid,),
+            ).fetchone()
+        if not row or row["rules_text"] is None:
+            return None
+        t = str(row["rules_text"]).strip()
+        return t if t else None
+    except Exception as exc:
+        logger.exception("get_editorial_rules: %s", exc)
+        return None
+
+
+def save_editorial_rules(
+    user_id: int | str,
+    rules_text: str,
+    feedbacks_count: int,
+) -> bool:
+    uid = _uid_str(user_id)
+    try:
+        fc = max(0, int(feedbacks_count))
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO editorial_rules (user_id, rules_text, feedbacks_count, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    rules_text = excluded.rules_text,
+                    feedbacks_count = excluded.feedbacks_count,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (uid, rules_text or "", fc),
+            )
+            conn.commit()
+        return True
+    except Exception as exc:
+        logger.exception("save_editorial_rules: %s", exc)
+        return False
+
+
+def get_feedbacks_count(user_id: int | str) -> int:
+    uid = _uid_str(user_id)
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM draft_feedback WHERE user_id=?",
+                (uid,),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+    except Exception as exc:
+        logger.exception("get_feedbacks_count: %s", exc)
+        return 0
+
+
+def get_editorial_feedbacks_baseline(user_id: int | str) -> int:
+    """Сколько записей draft_feedback уже учтено в последней дистилляции (0, если строки нет)."""
+    uid = _uid_str(user_id)
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT feedbacks_count FROM editorial_rules WHERE user_id=?",
+                (uid,),
+            ).fetchone()
+        return int(row["feedbacks_count"]) if row else 0
+    except Exception as exc:
+        logger.exception("get_editorial_feedbacks_baseline: %s", exc)
+        return 0
+
+
+def get_draft_feedback_slice(
+    user_id: int | str,
+    offset: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Срез фидбеков в порядке id ASC (для пакетной дистилляции)."""
+    uid = _uid_str(user_id)
+    off = max(0, int(offset))
+    lim = max(1, min(int(limit), 50))
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, user_id, draft_id, action, draft_preview, feedback_text, created_at
+                FROM draft_feedback
+                WHERE user_id=?
+                ORDER BY id ASC
+                LIMIT ? OFFSET ?
+                """,
+                (uid, lim, off),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.exception("get_draft_feedback_slice: %s", exc)
+        return []

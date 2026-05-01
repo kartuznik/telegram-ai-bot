@@ -56,12 +56,14 @@ from app.content_editor import (
     count_drafts,
     create_draft_from_search,
     draft_dm_text,
+    build_editorial_rules_overlay,
     build_voice_examples_overlay,
     format_auto_interval_label,
     format_editor_info_text,
     get_draft,
     get_oldest_draft,
     get_pending_edit,
+    get_pending_feedback,
     is_draft_expired,
     get_source_mode,
     hint_for_reject_from_draft,
@@ -71,6 +73,7 @@ from app.content_editor import (
     is_editor_callback,
     is_editor_enabled,
     is_private_chat,
+    maybe_distill_editorial_rules_sync,
     maybe_note_shorter_edit,
     migrate_strip_vesti_reject_hints,
     parse_auto_directive_from_rest,
@@ -78,9 +81,11 @@ from app.content_editor import (
     parse_editor_callback,
     parse_editor_extra_directives,
     pop_pending_edit,
+    pop_pending_feedback,
     reset_editor_reject_state,
     set_draft_status,
     set_pending_edit,
+    set_pending_feedback,
     update_draft_content,
 )
 from app.content_editor_background import run_content_editor_autofetch_loop
@@ -96,7 +101,12 @@ from app.scenario_simulator import (
     put_session,
     run_scenario_expand,
 )
-from app.database import init_db
+from app.database import (
+    get_editorial_feedbacks_baseline,
+    get_editorial_rules,
+    init_db,
+    save_draft_feedback,
+)
 from app.health_check import (
     OWNER_RESTART_USER_ID,
     attach_self_diagnostics,
@@ -191,6 +201,90 @@ _recent_user_text_for_draft: dict[int, tuple[str, float, int]] = {}
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 EXPIRED_APPROVE_YES = "editor_expired_yes"
 EXPIRED_APPROVE_NO = "editor_expired_no"
+FEEDBACK_SKIP = "feedback_skip"
+
+_FEEDBACK_WHY_SYSTEM = (
+    "Ты — Кузьма, редактор крипто-новостного канала. Пользователь только что принял решение по черновику поста "
+    "(апрув, отказ или правка). Задай ОДИН короткий живой вопрос (1–2 предложения), который проясняет мотивацию "
+    "и тон решения — без канцелярита, не начинай с «почему» / «зачем именно», можно с лёгким юмором. "
+    "Только сам вопрос, без преамбулы и без кавычек вокруг."
+)
+
+
+def _map_editor_action_to_feedback(action: str) -> str:
+    a = (action or "").strip().lower()
+    if a == "approved":
+        return "апрув (пост ушёл в канал)"
+    if a == "rejected":
+        return "отказ"
+    if a == "edited":
+        return "правка текста черновика"
+    return a or "решение по черновику"
+
+
+def _feedback_skip_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить →", callback_data=FEEDBACK_SKIP)]
+        ]
+    )
+
+
+async def _ask_why_after_action(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    draft_id: int | None,
+    action: str,
+    draft_body: str,
+) -> None:
+    """Асинхронно: один GPT-вопрос после ✅/❌/✏️; pending ставим только после удачной отправки."""
+    preview = (draft_body or "")[:400]
+    act_label = _map_editor_action_to_feedback(action)
+    user_prompt = (
+        f"Решение: {act_label}\n\n"
+        f"Фрагмент черновика (для контекста):\n{preview}\n\n"
+        "Сформулируй один вопрос пользователю."
+    )
+    try:
+        q = await asyncio.to_thread(
+            lambda: agent.run_raw_completion(
+                system=_FEEDBACK_WHY_SYSTEM,
+                user=user_prompt,
+                temperature=0.85,
+            )
+        )
+    except Exception as exc:
+        logger.warning("feedback_why: GPT error user_id=%s: %s", user_id, exc)
+        return
+    q = (q or "").strip()
+    if not q:
+        return
+    if len(q) > 1000:
+        q = q[:997] + "..."
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=q,
+            reply_markup=_feedback_skip_keyboard(),
+        )
+    except TelegramBadRequest as exc:
+        logger.warning("feedback_why: send failed user_id=%s: %s", user_id, exc)
+        return
+    set_pending_feedback(user_id, draft_id, action, draft_body)
+
+
+def _schedule_ask_why(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    draft_id: int | None,
+    action: str,
+    draft_body: str,
+) -> None:
+    asyncio.create_task(
+        _ask_why_after_action(bot, chat_id, user_id, draft_id, action, draft_body)
+    )
 
 
 def _expired_approve_keyboard(draft_id: int) -> InlineKeyboardMarkup:
@@ -462,6 +556,30 @@ async def _editor_require_private(message: Message) -> bool:
     return True
 
 
+def _telegram_answer_chunks(text: str, limit: int = 3900) -> list[str]:
+    """Дробит длинный текст для Telegram (лимит сообщения 4096)."""
+    t = (text or "").strip()
+    if not t:
+        return []
+    if len(t) <= limit:
+        return [t]
+    chunks: list[str] = []
+    pos = 0
+    n = len(t)
+    while pos < n:
+        end = min(pos + limit, n)
+        if end < n:
+            window_start = pos + (end - pos) * 2 // 3
+            nl = t.rfind("\n", window_start, end)
+            if nl > pos:
+                end = nl + 1
+        piece = t[pos:end].strip()
+        if piece:
+            chunks.append(piece)
+        pos = end
+    return chunks
+
+
 def _contains_draft_trigger(text: str) -> bool:
     low = (text or "").lower().strip()
     return any(word in low for word in _DRAFT_TRIGGER_WORDS)
@@ -541,11 +659,13 @@ async def _create_editor_draft_from_text(
         f"URL: {(source_url or 'файл пользователя')}\n"
     )
     voice_overlay = build_voice_examples_overlay(uid, limit=3)
+    rules_overlay = build_editorial_rules_overlay(uid)
     try:
         draft_text = await asyncio.to_thread(
             agent.run_raw_completion,
             system=DRAFT_SYSTEM
             + voice_overlay
+            + rules_overlay
             + "\nЕсли URL отсутствует, в строке «Источник:» укажи «файл пользователя».\n",
             user=user_block,
             max_tokens=1200,
@@ -855,6 +975,29 @@ async def editor_info_cmd(message: Message) -> None:
     await message.answer(format_editor_info_text(prefs, user_id=uid))
 
 
+@router.message(Command("editor_rules"))
+async def editor_rules_cmd(message: Message) -> None:
+    if not await _editor_require_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    rules = get_editorial_rules(uid)
+    if not rules or not str(rules).strip():
+        await message.answer(
+            "Пока нет сохранённых правил редактора — они складываются из твоих ответов на мой вопрос после ✅✏️❌. "
+            "Каждые пять таких ответов я пересобираю список и подмешиваю его в новые черновики. "
+            "Загляни сюда снова после пары решений 📋"
+        )
+        return
+    baseline = get_editorial_feedbacks_baseline(uid)
+    header = (
+        "📌 Устойчивые правила редактора — подмешиваются в генерацию черновиков "
+        f"(срез после {baseline} учтённых ответов на вопросы после решений):\n\n"
+    )
+    full = header + str(rules).strip()
+    for part in _telegram_answer_chunks(full, limit=3900):
+        await message.answer(part)
+
+
 @router.message(Command("drafts"))
 async def drafts_cmd(message: Message, bot: Bot) -> None:
     if not await _editor_require_private(message) or not message.from_user:
@@ -935,7 +1078,7 @@ async def drafts_cmd(message: Message, bot: Bot) -> None:
     )
 
 
-async def _handle_editor_revision_message(message: Message, draft_id: int) -> None:
+async def _handle_editor_revision_message(message: Message, bot: Bot, draft_id: int) -> None:
     if not message.from_user:
         return
     uid = message.from_user.id
@@ -959,6 +1102,14 @@ async def _handle_editor_revision_message(message: Message, draft_id: int) -> No
     await message.answer(
         draft_dm_text(row2),
         reply_markup=build_editor_keyboard(draft_id),
+    )
+    _schedule_ask_why(
+        bot,
+        message.chat.id,
+        uid,
+        draft_id,
+        "edited",
+        str(row2.get("content") or ""),
     )
 
 
@@ -1154,8 +1305,24 @@ async def text_handler(message: Message, bot: Bot) -> None:
     if is_private_chat(message) and not text.strip().startswith("/"):
         pe = get_pending_edit(uid)
         if pe is not None:
-            await _handle_editor_revision_message(message, pe)
+            await _handle_editor_revision_message(message, bot, pe)
             return
+        pf = get_pending_feedback(uid)
+        if pf is not None:
+            did = pf.get("draft_id")
+            draft_id = int(did) if did is not None else None
+            rid = save_draft_feedback(
+                uid,
+                draft_id,
+                str(pf.get("action") or ""),
+                str(pf.get("draft_preview") or ""),
+                text.strip(),
+            )
+            pop_pending_feedback(uid)
+            if rid is not None:
+                asyncio.create_task(
+                    asyncio.to_thread(maybe_distill_editorial_rules_sync, agent, uid)
+                )
 
     wants_url_draft, found_url = _should_create_draft_from_url_text(message)
     if wants_url_draft and found_url:
@@ -1628,6 +1795,13 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
 
     await callback.answer()
 
+    if data == FEEDBACK_SKIP:
+        pop_pending_feedback(user_id)
+        await callback.message.answer(
+            "Окей, без комментария — запомнил как пропуск ✋ В другой раз расскажешь, если захочешь."
+        )
+        return
+
     await safe_send_chat_action(bot, callback.message.chat.id, "typing")
 
     if is_anchor_callback(data):
@@ -1764,6 +1938,7 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
         if src_ch:
             bump_channel_quality(src_ch, approved_inc=1)
         await callback.message.answer("Публикую несмотря на возраст новости — пост ушёл в канал ✅")
+        _schedule_ask_why(bot, callback.message.chat.id, user_id, did, "approved", body)
         return
 
     if is_editor_callback(data):
@@ -1812,6 +1987,7 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             await callback.message.answer(
                 "Пост улетел в @kriptogeograph — ты на режиссёре, я на суфлёре 🎬✅"
             )
+            _schedule_ask_why(bot, callback.message.chat.id, user_id, did, "approved", body)
             pending_after = count_drafts(user_id, "draft")
             logger.info(
                 "editor approve: user_id=%s draft_id=%s pending_after=%s",
@@ -1856,6 +2032,7 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             await callback.message.answer(
                 "Записал отказ в мою «чёрную маленькую тетрадь» подбора — в следующий раз уйду чуть в сторону 📝❌"
             )
+            _schedule_ask_why(bot, callback.message.chat.id, user_id, did, "rejected", body)
             return
         if act == "e":
             set_pending_edit(user_id, did)
