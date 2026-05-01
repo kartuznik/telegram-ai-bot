@@ -48,6 +48,12 @@ def init_stats_db(db_path: str | Path | None = None) -> None:
                     user_id INTEGER NOT NULL,
                     PRIMARY KEY (stat_date, user_id)
                 );
+                CREATE TABLE IF NOT EXISTS channel_quality (
+                    channel_username TEXT PRIMARY KEY,
+                    approved_count INTEGER NOT NULL DEFAULT 0,
+                    rejected_count INTEGER NOT NULL DEFAULT 0,
+                    last_updated TEXT NOT NULL DEFAULT (datetime('now'))
+                );
                 """
             )
             conn.commit()
@@ -196,6 +202,94 @@ def get_daily_breakdown(days: int = 7) -> list[dict[str, Any]]:
     except Exception as exc:
         logger.exception("Статистика: ошибка get_daily_breakdown: %s", exc)
         return []
+
+
+def _norm_channel_username(channel_username: str) -> str:
+    return (channel_username or "").strip().lower().lstrip("@")
+
+
+def bump_channel_quality(
+    channel_username: str,
+    *,
+    approved_inc: int = 0,
+    rejected_inc: int = 0,
+) -> None:
+    uname = _norm_channel_username(channel_username)
+    if not uname:
+        return
+    ai = max(0, int(approved_inc))
+    ri = max(0, int(rejected_inc))
+    if ai == 0 and ri == 0:
+        return
+    try:
+        with _connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO channel_quality (channel_username, approved_count, rejected_count, last_updated)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(channel_username) DO UPDATE SET
+                    approved_count = channel_quality.approved_count + excluded.approved_count,
+                    rejected_count = channel_quality.rejected_count + excluded.rejected_count,
+                    last_updated = datetime('now')
+                """,
+                (uname, ai, ri),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.exception("Статистика: bump_channel_quality(%s): %s", uname, exc)
+
+
+def get_channel_quality_snapshot() -> dict[str, tuple[int, int]]:
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT channel_username, approved_count, rejected_count
+                FROM channel_quality
+                """
+            ).fetchall()
+        return {
+            str(r["channel_username"]): (int(r["approved_count"]), int(r["rejected_count"]))
+            for r in rows
+        }
+    except Exception as exc:
+        logger.exception("Статистика: get_channel_quality_snapshot: %s", exc)
+        return {}
+
+
+def get_channel_quality_top_bottom(
+    *,
+    top_limit: int = 5,
+    bottom_limit: int = 3,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT channel_username, approved_count, rejected_count
+                FROM channel_quality
+                WHERE approved_count > 0 OR rejected_count > 0
+                """
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            approved = int(r["approved_count"])
+            rejected = int(r["rejected_count"])
+            ratio = approved / max(1, rejected)
+            items.append(
+                {
+                    "channel_username": str(r["channel_username"]),
+                    "approved_count": approved,
+                    "rejected_count": rejected,
+                    "ratio": ratio,
+                }
+            )
+        top = sorted(items, key=lambda x: (x["ratio"], x["approved_count"]), reverse=True)[: max(1, top_limit)]
+        bottom = sorted(items, key=lambda x: (x["ratio"], -x["rejected_count"]))[: max(1, bottom_limit)]
+        return top, bottom
+    except Exception as exc:
+        logger.exception("Статистика: get_channel_quality_top_bottom: %s", exc)
+        return [], []
 
 
 def reset_stats_db_path_for_tests() -> None:

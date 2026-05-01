@@ -273,6 +273,10 @@ CATEGORY_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     for category, tokens in _CATEGORY_TOKENS.items()
 }
 
+BREAKING_PATTERN = re.compile(
+    r"(?i)\b(?:срочно|breaking|только\s+что|экстренно|молния|срочная\s+новость|just\s+in|urgent|alert|developing)\b"
+)
+
 
 def match_categories(text: str) -> dict[str, list[str]]:
     body = text or ""

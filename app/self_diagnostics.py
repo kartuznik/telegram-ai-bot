@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 GET_ME_TIMEOUT_SEC = 20.0
 GET_ME_FAIL_THRESHOLD = 3
 # Нет входящих апдейтов дольше этого — считаем polling зависшим и перезапускаем.
-POLL_STUCK_IDLE_SEC = 30 * 60
+POLL_STUCK_IDLE_SEC = 90 * 60
 
 
 def _format_duration(seconds: float) -> str:

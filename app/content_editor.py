@@ -15,15 +15,17 @@ from app.config import Config
 from app.database import get_connection
 from app.llm_agent import LLMAgent
 from app.memory import ChatMemory
+from app.statistics import get_channel_quality_snapshot, get_channel_quality_top_bottom
 
 logger = logging.getLogger(__name__)
 
 try:
-    from app.news_bot_patterns import match_categories, score_text
+    from app.news_bot_patterns import BREAKING_PATTERN, match_categories, score_text
 
     USE_PATTERNS = True
 except ImportError:
     USE_PATTERNS = False
+    BREAKING_PATTERN = re.compile(r"$^")
 
     def match_categories(text: str) -> dict[str, list[str]]:
         return {}
@@ -53,10 +55,13 @@ PREF_AUTO_INTRO_SENT = "content_editor_auto_intro_sent"
 PREF_SOURCE_MODE = "content_editor_source_mode"
 PREF_TG_CHANNELS = "content_editor_tg_channels"
 PREF_HOST_REJECT_COUNTS = "content_editor_reject_host_counts"
+PREF_DRAFT_DEADLINE_HOURS = "content_editor_draft_deadline_hours"
 
 DEFAULT_AUTO_INTERVAL_HOURS = 0.5
 MIN_AUTO_INTERVAL_HOURS = 0.5
 MAX_AUTO_INTERVAL_HOURS = 168
+DEFAULT_DRAFT_DEADLINE_HOURS = 24
+ALLOWED_DRAFT_DEADLINE_HOURS = frozenset({24, 48, 72})
 # Максимум черновиков в статусе draft на пользователя (ручной /drafts, авто-поиск, insert).
 MAX_PENDING_UNAPPROVED_DRAFTS = 6
 # Окна исключения source_url (подставляются из Config в init_content_editor_defaults).
@@ -66,6 +71,7 @@ _EXCLUDE_REJECTED_DAYS = 7
 AUTO_DIRECTIVE_RE = re.compile(
     r"(?is)(?<!\S)авто\s*:\s*((?:\d{1,3}(?:[.,]\d+)?|off|выкл|0))\b",
 )
+DEADLINE_DIRECTIVE_RE = re.compile(r"(?is)(?<!\S)дедлайн\s*:\s*(24|48|72)\b")
 SOURCES_MODE_RE = re.compile(r"(?is)(?<!\S)источники\s*:\s*(web|tg|both)\b")
 # «тканалы» — частая опечатка вместо «тгканалы» (без буквы г).
 TG_CHANNELS_RE = re.compile(
@@ -90,6 +96,77 @@ HOST_HARD_REJECT_THRESHOLD = 4
 URL_REJECT_PREFIX = "url:"
 VESTI_CLEANUP_USER_ID = 504425191
 VESTI_HOST_KEYS = frozenset({"vesti.ru", "www.vesti.ru"})
+WEB_PROMO_DOMAINS = (
+    "goha.ru",
+    "store.steampowered.com",
+    "epicgames.com",
+    "apps.apple.com",
+    "play.google.com",
+    # В запрос Tavily добавляем доменное исключение; путь /sponsored отдельно не поддерживается через -site:.
+    "ign.com",
+)
+TRUSTED_DOMAINS = frozenset(
+    {
+        "ria.ru",
+        "tass.ru",
+        "rbc.ru",
+        "kommersant.ru",
+        "vedomosti.ru",
+        "lenta.ru",
+        "meduza.io",
+        "bbc.com",
+        "reuters.com",
+        "techcrunch.com",
+        "ign.com",
+        "kotaku.com",
+        "animenewsnetwork.com",
+        "crunchyroll.com",
+    }
+)
+SEMANTIC_DUP_STOPWORDS = frozenset(
+    {
+        "в",
+        "на",
+        "и",
+        "с",
+        "по",
+        "за",
+        "из",
+        "от",
+        "для",
+        "что",
+        "как",
+        "это",
+        "он",
+        "она",
+        "они",
+        "the",
+        "a",
+        "an",
+        "is",
+        "of",
+        "to",
+        "in",
+        "and",
+        "for",
+    }
+)
+_DRAFT_ACTION_VERBS = (
+    "вышел",
+    "запустил",
+    "объявил",
+    "сообщил",
+    "показал",
+    "представил",
+    "выпустил",
+    "анонсировал",
+    "revealed",
+    "announced",
+    "launched",
+    "released",
+    "reported",
+    "confirmed",
+)
 
 _TG_DEFAULT_USERNAMES: list[str] = [
     "rian_ru",
@@ -109,6 +186,11 @@ DRAFT_SYSTEM = (
     "Ты — Кузьма, редактор коротких постов для Telegram-канала @kriptogeograph. "
     "Темы задаёт пользователь — это могут быть новости, наука, шоу-бизнес, технологии, путешествия, спорт и что угодно ещё; "
     "не впихивай финансовую рамку, если материал не про деньги, рынки или вложения.\n"
+    "Пиши в новостном стиле: факты, событие, что произошло и почему это важно.\n"
+    "Запрещено: рекламные призывы, восторженные описания продуктов и маркетинговые формулировки "
+    "вроде «лучший», «невероятный», «потрясающий».\n"
+    "Разрешено: лёгкий юмор и живой язык, но основа текста — новостная фактура.\n"
+    "Если источник написан рекламно, перепиши факты своими словами и не копируй его тон.\n"
     "Напиши ОДИН готовый пост: цепляющий заголовок в первой строке, пустая строка, "
     "2–3 предложения саммари с лёгким юмором и 2–3 разных эмодзи, пустая строка, "
     "строка «Источник:» и URL из входных данных.\n"
@@ -294,6 +376,17 @@ def auto_interval_hours_from_prefs(prefs: dict[str, str]) -> float:
     return max(MIN_AUTO_INTERVAL_HOURS, min(MAX_AUTO_INTERVAL_HOURS, h))
 
 
+def draft_deadline_hours_from_prefs(prefs: dict[str, str]) -> int:
+    raw = (prefs.get(PREF_DRAFT_DEADLINE_HOURS) or "").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        v = DEFAULT_DRAFT_DEADLINE_HOURS
+    if v not in ALLOWED_DRAFT_DEADLINE_HOURS:
+        v = DEFAULT_DRAFT_DEADLINE_HOURS
+    return v
+
+
 def parse_auto_directive_from_rest(rest: str) -> tuple[str, dict[str, str] | None]:
     """Достаёт «авто:X» из хвоста /editor_prefs; последняя директива определяет значение."""
     s = (rest or "").strip()
@@ -319,6 +412,21 @@ def parse_auto_directive_from_rest(rest: str) -> tuple[str, dict[str, str] | Non
         updates[PREF_AUTO_INTERVAL_HOURS] = _fmt_hours_value(h)
         updates[PREF_AUTO_DISABLED_REASON] = ""
     return cleaned, updates
+
+
+def parse_deadline_directive_from_rest(rest: str) -> tuple[str, dict[str, str] | None]:
+    """Достаёт «дедлайн:24|48|72» из хвоста /editor_prefs; последняя директива определяет значение."""
+    s = (rest or "").strip()
+    if not s:
+        return "", None
+    matches = list(DEADLINE_DIRECTIVE_RE.finditer(s))
+    if not matches:
+        return s, None
+    last = matches[-1]
+    val = int(last.group(1))
+    cleaned = DEADLINE_DIRECTIVE_RE.sub(" ", s)
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned, {PREF_DRAFT_DEADLINE_HOURS: str(val)}
 
 
 def init_content_editor_defaults(cfg: Config | None = None) -> None:
@@ -461,7 +569,65 @@ def _merged_tg_channel_names(prefs: dict[str, str]) -> list[str]:
     return list(_TG_DEFAULT_USERNAMES)
 
 
-def format_editor_info_text(prefs: dict[str, str]) -> str:
+def _approved_posts_count(user_id: int) -> int:
+    uid = str(user_id)
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM draft_posts
+                WHERE user_id=? AND status='posted' AND approved_at IS NOT NULL
+                """,
+                (uid,),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+    except Exception as exc:
+        logger.exception("approved_posts_count: %s", exc)
+        return 0
+
+
+def get_voice_examples(user_id: int, limit: int = 3) -> list[str]:
+    """Последние апрувнутые посты пользователя — как эталоны голоса канала."""
+    uid = str(user_id)
+    lim = max(3, min(5, int(limit or 3)))
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT content
+                FROM draft_posts
+                WHERE user_id=? AND status='posted' AND approved_at IS NOT NULL
+                ORDER BY datetime(approved_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (uid, lim),
+            ).fetchall()
+        out: list[str] = []
+        for r in rows:
+            t = str(r["content"] or "").strip()
+            if t:
+                out.append(t[:900])
+        return out
+    except Exception as exc:
+        logger.exception("get_voice_examples: %s", exc)
+        return []
+
+
+def build_voice_examples_overlay(user_id: int, limit: int = 3) -> str:
+    examples = get_voice_examples(user_id, limit=limit)
+    if not examples:
+        return ""
+    lines = [f"{i + 1}) {txt}" for i, txt in enumerate(examples)]
+    return (
+        "\nВот примеры постов, которые автор канала одобрил ранее — "
+        "используй их как ориентир стиля и тона:\n"
+        + "\n\n".join(lines)
+        + "\n"
+    )
+
+
+def format_editor_info_text(prefs: dict[str, str], *, user_id: int | None = None) -> str:
     """Текст для /editor_info — сводка prefs редактора."""
     sm = get_source_mode(prefs)
     tg_raw = (prefs.get(PREF_TG_CHANNELS) or "").strip()
@@ -477,6 +643,35 @@ def format_editor_info_text(prefs: dict[str, str]) -> str:
     auto_on = is_auto_enabled_pref(prefs)
     auto = "включён" if auto_on else "выключен"
     ah = auto_interval_hours_from_prefs(prefs)
+    deadline_h = draft_deadline_hours_from_prefs(prefs)
+    voice_line = ""
+    quality_line = ""
+    if user_id is not None:
+        approved_n = _approved_posts_count(user_id)
+        if approved_n >= 10:
+            logger.info("editor_voice: user_id=%s voice сформирован (%s+ апрувов)", user_id, approved_n)
+            voice_line = f"• Голос канала: сформирован ({approved_n} апрувов)\n"
+        else:
+            voice_line = f"• Голос канала: в обучении ({approved_n}/10 апрувов)\n"
+        top_ch, bad_ch = get_channel_quality_top_bottom(top_limit=5, bottom_limit=3)
+        if top_ch:
+            top_txt = "; ".join(
+                f"@{x['channel_username']} (A:{x['approved_count']} / R:{x['rejected_count']})"
+                for x in top_ch
+            )
+        else:
+            top_txt = "пока нет данных"
+        if bad_ch:
+            bad_txt = "; ".join(
+                f"@{x['channel_username']} (A:{x['approved_count']} / R:{x['rejected_count']})"
+                for x in bad_ch
+            )
+        else:
+            bad_txt = "пока нет данных"
+        quality_line = (
+            f"• Топ-5 каналов по апрувам: {top_txt}\n"
+            f"• Худшие 3 канала по апрувам: {bad_txt}\n"
+        )
     return (
         "Текущие настройки редактора:\n\n"
         f"• Источники: {sm} (web / tg / both)\n"
@@ -484,13 +679,17 @@ def format_editor_info_text(prefs: dict[str, str]) -> str:
         f"  ({tg_note})\n\n"
         f"• Темы: {topics[:500]}{'…' if len(topics) > 500 else ''}\n"
         f"• Уточнение к поиску: {sources[:500]}{'…' if len(sources) > 500 else ''}\n\n"
-        f"• Авто-поиск: {auto}"
+        f"• Срок жизни черновика: {deadline_h} ч\n"
+        + voice_line
+        + quality_line
+        + f"• Авто-поиск: {auto}"
         + (f", интервал {format_auto_interval_label(ah)}" if auto_on else "")
         + "\n\n"
         "Команды настройки (можно смешивать в одной строке):\n"
         "• темы: … или темы … — только темы и уточнение (через запятую после первой темы);\n"
         "• тгканалы: … или тгканалы @a @b — только список каналов;\n"
-        "• источники: web|tg|both — режим материалов.\n"
+        "• источники: web|tg|both — режим материалов;\n"
+        "• дедлайн:24|48|72 — срок жизни черновика.\n"
         "Сброс отказов и жёстких банов по каналу/сайту: /editor_reset_rejects"
     )
 
@@ -554,6 +753,153 @@ def _norm_cmp_url(url: str) -> str:
         return f"{scheme}://{net}{path}".rstrip("/")
     except Exception:
         return u.rstrip("/")
+
+
+def extract_tg_channel_username_from_url(url: str) -> str | None:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    try:
+        p = urlparse(raw)
+        host = (p.netloc or "").lower()
+        if "t.me" not in host and "telegram.me" not in host:
+            return None
+        parts = [x for x in (p.path or "").split("/") if x]
+        if not parts:
+            return None
+        if parts[0].lower() == "s" and len(parts) >= 2:
+            return parts[1].strip().lstrip("@").lower() or None
+        return parts[0].strip().lstrip("@").lower() or None
+    except Exception:
+        return None
+
+
+def _source_verification_line(url: str, *, from_telegram: bool) -> str:
+    if from_telegram:
+        return ""
+    raw = (url or "").strip()
+    if not raw:
+        return "⚠️ Источник не верифицирован"
+    try:
+        host = (urlparse(raw).netloc or "").lower().lstrip("www.")
+    except Exception:
+        host = ""
+    if not host:
+        return "⚠️ Источник не верифицирован"
+    if "t.me" in host or "telegram.me" in host:
+        return ""
+    if any(host == d or host.endswith(f".{d}") for d in TRUSTED_DOMAINS):
+        return "✅ Источник проверен"
+    return "⚠️ Источник не верифицирован"
+
+
+def _title_tokens_for_similarity(title: str) -> set[str]:
+    t = (title or "").lower().replace("ё", "е")
+    words = re.findall(r"[a-zа-я0-9]+", t)
+    return {w for w in words if len(w) > 1 and w not in SEMANTIC_DUP_STOPWORDS}
+
+
+def _is_duplicate_by_title(title: str, user_id: int) -> bool:
+    words_new = _title_tokens_for_similarity(title)
+    if not words_new:
+        return False
+    uid = str(user_id)
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT content
+                FROM draft_posts
+                WHERE user_id=?
+                  AND status='posted'
+                  AND approved_at IS NOT NULL
+                  AND datetime(approved_at) >= datetime('now', '-14 days')
+                ORDER BY datetime(approved_at) DESC, id DESC
+                LIMIT 30
+                """,
+                (uid,),
+            ).fetchall()
+    except Exception as exc:
+        logger.exception("semantic_duplicate check: %s", exc)
+        return False
+
+    for r in rows:
+        prev_content = str(r["content"] or "")
+        prev_title = (prev_content.splitlines()[0] if prev_content else "").strip()
+        words_prev = _title_tokens_for_similarity(prev_title)
+        if not words_prev:
+            continue
+        similarity = len(words_new & words_prev) / max(1, len(words_new))
+        if similarity >= 0.6:
+            logger.debug(
+                "skip semantic_duplicate title=%r prev=%r similarity=%.3f",
+                (title or "")[:120],
+                prev_title[:120],
+                similarity,
+            )
+            return True
+    return False
+
+
+def _assess_draft_quality(draft_text: str) -> tuple[bool, str]:
+    text = (draft_text or "").strip()
+    if len(text) < 100:
+        return False, "too_short"
+    if not re.search(r"\d", text):
+        return False, "no_numbers_or_dates"
+    if text.count("!") > 3:
+        return False, "too_emotional_exclamations"
+    low = text.lower().replace("ё", "е")
+    if not any(v in low for v in _DRAFT_ACTION_VERBS):
+        return False, "no_action_verb"
+    return True, "ok"
+
+
+def _get_related_context(user_id: int, title: str, limit: int = 20) -> str | None:
+    words_new = _title_tokens_for_similarity(title)
+    if not words_new:
+        return None
+    uid = str(user_id)
+    lim = max(1, min(50, int(limit or 20)))
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT content
+                FROM draft_posts
+                WHERE user_id=? AND status='posted'
+                ORDER BY datetime(approved_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (uid, lim),
+            ).fetchall()
+    except Exception as exc:
+        logger.exception("related_context check: %s", exc)
+        return None
+
+    for r in rows:
+        prev_content = str(r["content"] or "")
+        prev_title = (prev_content.splitlines()[0] if prev_content else "").strip()
+        if not prev_title:
+            continue
+        words_prev = _title_tokens_for_similarity(prev_title)
+        if not words_prev:
+            continue
+        similarity = len(words_new & words_prev) / max(1, len(words_new))
+        if similarity >= 0.4:
+            return f"Кстати, ранее по теме: {prev_title}"
+    return None
+
+
+def _insert_after_source_line(text: str, extra_line: str) -> str:
+    if not extra_line.strip():
+        return text
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith("источник:"):
+            out = lines[: i + 1] + ["", extra_line] + lines[i + 1 :]
+            return "\n".join(out).strip()
+    return f"{text.rstrip()}\n\n{extra_line}".strip()
 
 
 def _is_domain_only_hint(h: str) -> bool:
@@ -902,11 +1248,59 @@ def count_drafts(user_id: int, status: str = "draft") -> int:
         return 999
 
 
+def _expire_due_drafts(user_id: int) -> int:
+    uid = str(user_id)
+    try:
+        with get_connection() as conn:
+            n = conn.execute(
+                """
+                UPDATE draft_posts
+                SET status='expired'
+                WHERE user_id=?
+                  AND status='draft'
+                  AND expires_at IS NOT NULL
+                  AND datetime(expires_at) <= datetime('now')
+                """,
+                (uid,),
+            ).rowcount
+            conn.commit()
+        if n > 0:
+            logger.info("draft_expire: user_id=%s auto_expired=%s", user_id, n)
+        return int(n)
+    except Exception as exc:
+        logger.exception("draft_expire: %s", exc)
+        return 0
+
+
+def is_draft_expired(row: dict[str, Any] | None) -> bool:
+    if not row:
+        return False
+    exp = (row.get("expires_at") or "").strip()
+    if not exp:
+        return False
+    try:
+        with get_connection() as conn:
+            r = conn.execute(
+                "SELECT datetime(?) <= datetime('now') AS is_exp",
+                (exp,),
+            ).fetchone()
+        return bool(r and int(r["is_exp"]) == 1)
+    except Exception:
+        return False
+
+
+def _draft_kind_for_insert(source_url: str | None) -> str:
+    # Для текущего этапа считаем новостными черновики, пришедшие из URL/веб-источников.
+    return "news" if (source_url or "").strip() else "other"
+
+
 def insert_draft(
     user_id: int,
     channel_id: str,
     content: str,
     source_url: str | None,
+    *,
+    deadline_hours: int | None = None,
 ) -> tuple[bool, int | str]:
     uid = str(user_id)
     pending = count_drafts(user_id, "draft")
@@ -922,14 +1316,21 @@ def insert_draft(
             f"Черновиков уже {MAX_PENDING_UNAPPROVED_DRAFTS} — утверди или отмени старые, иначе я захламлюсь как черновик в столе 📎",
         )
     body = (content or "").strip()[:MAX_POST_CHARS]
+    dl_h = deadline_hours or DEFAULT_DRAFT_DEADLINE_HOURS
+    if dl_h not in ALLOWED_DRAFT_DEADLINE_HOURS:
+        dl_h = DEFAULT_DRAFT_DEADLINE_HOURS
+    kind = _draft_kind_for_insert(source_url)
+    ttl_h = 24 if kind == "news" else 72
+    # Пользователь может задать дедлайн, но не больше базового TTL по типу материала.
+    ttl_h = max(1, min(ttl_h, dl_h))
     try:
         with get_connection() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO draft_posts (user_id, channel_id, content, source_url, status)
-                VALUES (?, ?, ?, ?, 'draft')
+                INSERT INTO draft_posts (user_id, channel_id, content, source_url, status, expires_at)
+                VALUES (?, ?, ?, ?, 'draft', datetime('now', ?))
                 """,
-                (uid, channel_id, body, source_url or None),
+                (uid, channel_id, body, source_url or None, f"+{ttl_h} hours"),
             )
             conn.commit()
             return True, int(cur.lastrowid)
@@ -944,7 +1345,7 @@ def get_draft(user_id: int, draft_id: int) -> dict[str, Any] | None:
         with get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url
+                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url, expires_at
                 FROM draft_posts WHERE id=? AND user_id=?
                 """,
                 (draft_id, uid),
@@ -962,7 +1363,9 @@ def update_draft_content(user_id: int, draft_id: int, new_content: str) -> bool:
         with get_connection() as conn:
             n = conn.execute(
                 """
-                UPDATE draft_posts SET content=? WHERE id=? AND user_id=? AND status='draft'
+                UPDATE draft_posts
+                SET content=?, was_edited=1
+                WHERE id=? AND user_id=? AND status='draft'
                 """,
                 (body, draft_id, uid),
             ).rowcount
@@ -1009,7 +1412,7 @@ def get_latest_draft(user_id: int, status: str = "draft") -> dict[str, Any] | No
         with get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url
+                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url, expires_at
                 FROM draft_posts WHERE user_id=? AND status=?
                 ORDER BY id DESC LIMIT 1
                 """,
@@ -1025,11 +1428,19 @@ def get_oldest_draft(user_id: int, status: str = "draft") -> dict[str, Any] | No
     """Самый старый черновик в очереди (FIFO для /drafts)."""
     uid = str(user_id)
     try:
+        if status == "draft":
+            _expire_due_drafts(user_id)
         with get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url
-                FROM draft_posts WHERE user_id=? AND status=?
+                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url, expires_at
+                FROM draft_posts
+                WHERE user_id=?
+                  AND status=?
+                  AND (
+                    expires_at IS NULL
+                    OR datetime(expires_at) > datetime('now')
+                  )
                 ORDER BY id ASC LIMIT 1
                 """,
                 (uid, status),
@@ -1069,6 +1480,7 @@ class DraftPick:
     snippet: str
     from_telegram: bool = False
     telegram_display: str = ""
+    source_channel_username: str = ""
 
 
 def _reject_hints_for_tavily_query(rejects: list[str]) -> list[str]:
@@ -1119,9 +1531,23 @@ def _snippet_from_tavily_item(it: dict[str, Any]) -> str:
     return ""
 
 
+def _freshness_terms_for_query(topics: str, sources: str) -> list[str]:
+    """Ключевые слова свежести для Tavily в зависимости от языка темы."""
+    text = f"{topics} {sources}".strip()
+    has_cyrillic = bool(re.search(r"[а-яё]", text.lower()))
+    if has_cyrillic:
+        return ["сегодня", "вчера", "последние новости", "breaking"]
+    return ["today", "yesterday", "latest news", "breaking"]
+
+
+def _promo_domain_exclusion_terms() -> list[str]:
+    return [f"-site:{domain}" for domain in WEB_PROMO_DOMAINS]
+
+
 def _pick_draft_item(
     agent: LLMAgent,
     prefs: dict[str, str],
+    user_id: int,
     excluded_urls: set[str] | None = None,
 ) -> DraftPick | None:
     """Подбор материала: Tavily (web), публичные TG-каналы (t.me/s), фильтры отказов."""
@@ -1135,15 +1561,30 @@ def _pick_draft_item(
     sources = (prefs.get(PREF_SOURCES) or "").strip()
     rejects = _reject_list(prefs)
     reject_urls, hard_hosts, soft_hosts, kw_strings = _build_reject_filters(rejects, prefs)
+    channel_quality = get_channel_quality_snapshot()
 
     candidates: list[dict[str, Any]] = []
 
     if mode in ("web", "both") and agent.tavily:
-        q = f"{topics} {sources}".strip() + " последние новости"
+        freshness_terms = _freshness_terms_for_query(topics, sources)
+        freshness_hint = " ".join(freshness_terms)
+        promo_exclusions = _promo_domain_exclusion_terms()
+        q = f"{topics} {sources} {freshness_hint} {' '.join(promo_exclusions)}".strip()
+        logger.debug(
+            "Pick draft: web promo blacklist excluded domains=%s",
+            ", ".join(WEB_PROMO_DOMAINS),
+        )
         tail = _reject_hints_for_tavily_query(rejects)
         if tail:
             q += ". Исключай или обходи материалы, связанные с: " + ", ".join(tail)
-        result = agent._tavily_search(q[:400], max_results=6)
+        result = agent._tavily_search(q[:400], max_results=6, days=2)
+        result_items = result.get("results") if isinstance(result, dict) else None
+        if isinstance(result_items, list) and len(result_items) == 0:
+            logger.debug(
+                "Pick draft: Tavily вернул 0 результатов с days=2, fallback на days=5, query=%r",
+                q[:220],
+            )
+            result = agent._tavily_search(q[:400], max_results=6, days=5)
         if result and isinstance(result.get("results"), list):
             for it in result["results"]:
                 if isinstance(it, dict):
@@ -1154,6 +1595,7 @@ def _pick_draft_item(
                             "snippet": _snippet_from_tavily_item(it)[:800],
                             "from_tg": False,
                             "tg_disp": "",
+                            "source_channel_username": "",
                         }
                     )
         else:
@@ -1198,6 +1640,7 @@ def _pick_draft_item(
                     "snippet": ((p.get("content") or "").strip())[:800],
                     "from_tg": True,
                     "tg_disp": f"@{p.get('channel_username', '')}",
+                    "source_channel_username": str(p.get("channel_username") or "").strip().lstrip("@").lower(),
                 }
             )
 
@@ -1209,7 +1652,9 @@ def _pick_draft_item(
     if not candidates:
         return None
 
-    ranked: list[tuple[int, int, int, dict[str, Any], str, dict[str, int], dict[str, list[str]]]] = []
+    ranked: list[
+        tuple[int, float, int, dict[str, Any], str, dict[str, int], dict[str, list[str]], float, float]
+    ] = []
     for i, c in enumerate(candidates):
         url = (c.get("url") or "").strip()
         host = _host(url).replace("www.", "")
@@ -1238,11 +1683,41 @@ def _pick_draft_item(
                 score_map = {}
                 cat_matches = {}
                 total_score = 0
-        ranked.append((soft_pen, -total_score, i, c, pattern_reason, score_map, cat_matches))
+        src_ch = str(c.get("source_channel_username") or "").strip().lower()
+        approved_c, rejected_c = channel_quality.get(src_ch, (0, 0))
+        quality_mult = 1.0 + (approved_c / max(1, rejected_c))
+        breaking_mult = 1.0
+        if BREAKING_PATTERN.search(post_text):
+            breaking_mult = 3.0
+            logger.debug("breaking news boost url=%r", (c.get("url") or "")[:140])
+        effective_score = float(total_score) * quality_mult * breaking_mult
+        ranked.append(
+            (
+                soft_pen,
+                -effective_score,
+                i,
+                c,
+                pattern_reason,
+                score_map,
+                cat_matches,
+                quality_mult,
+                breaking_mult,
+            )
+        )
     ranked.sort(key=lambda x: (x[0], x[1], x[2]))
 
     n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = 0
-    for soft_pen, _score_sort, _idx, c, pattern_reason, score_map, cat_matches in ranked:
+    for (
+        soft_pen,
+        _score_sort,
+        _idx,
+        c,
+        pattern_reason,
+        score_map,
+        cat_matches,
+        quality_mult,
+        breaking_mult,
+    ) in ranked:
         url = (c.get("url") or "").strip()
         if not url:
             n_no_url += 1
@@ -1270,6 +1745,10 @@ def _pick_draft_item(
         title = (c.get("title") or "").strip() or "Без заголовка"
         content = (c.get("snippet") or "").strip()
         blob = (title + " " + content).lower()
+        if _is_duplicate_by_title(title, user_id):
+            logger.debug("Pick draft: skip semantic_duplicate title=%r", title[:140])
+            n_kw += 1
+            continue
         pattern_accept = False
         pattern_info = pattern_reason
         if USE_PATTERNS:
@@ -1300,13 +1779,15 @@ def _pick_draft_item(
                 logger.debug("Pick draft: skip keyword %r", matched_bad)
                 continue
         logger.info(
-            "Pick draft: выбран url=%r reject_key=%s netloc=%s tg=%s soft_penalty=%s total_score=%s",
+            "Pick draft: выбран url=%r reject_key=%s netloc=%s tg=%s soft_penalty=%s total_score=%s quality_mult=%.3f breaking_mult=%.1f",
             url[:120],
             rj_key or "?",
             _host(url) or "?",
             c.get("from_tg"),
             soft_pen,
             sum(score_map.values()) if USE_PATTERNS else 0,
+            quality_mult,
+            breaking_mult,
         )
         return DraftPick(
             title=title,
@@ -1314,6 +1795,7 @@ def _pick_draft_item(
             snippet=content[:800],
             from_telegram=bool(c.get("from_tg")),
             telegram_display=str(c.get("tg_disp") or ""),
+            source_channel_username=str(c.get("source_channel_username") or "").strip().lower(),
         )
     if (
         n_excluded == len(candidates)
@@ -1344,6 +1826,7 @@ def _pick_draft_item(
 
 def draft_post_from_snippet(
     agent: LLMAgent,
+    user_id: int,
     title: str,
     snippet: str,
     url: str,
@@ -1364,6 +1847,10 @@ def draft_post_from_snippet(
     if _draft_material_sounds_financial(topics, title, snippet):
         finance_overlay = DRAFT_FINANCE_OVERLAY
         logger.debug("Draft: включён финансовый дисклеймер (тема/сниппет похожи на рынок или вложения)")
+    voice_overlay = build_voice_examples_overlay(user_id, limit=3)
+    approved_n = _approved_posts_count(user_id)
+    if approved_n >= 10:
+        logger.info("editor_voice: user_id=%s voice сформирован (%s+ апрувов)", user_id, approved_n)
     user_block = (
         f"Темы пользователя: {topics}\n"
         f"Заголовок источника: {title}\n"
@@ -1371,7 +1858,7 @@ def draft_post_from_snippet(
         f"URL: {url}\n"
     )
     raw = agent.run_raw_completion(
-        system=DRAFT_SYSTEM + tg_overlay + finance_overlay,
+        system=DRAFT_SYSTEM + tg_overlay + finance_overlay + voice_overlay,
         user=user_block,
         max_tokens=1200,
         temperature=min(0.82, getattr(agent, "_chat_temperature", 0.75) + 0.05),
@@ -1381,6 +1868,22 @@ def draft_post_from_snippet(
     logger.info("Draft from snippet: len=%s chars, preview=%r", len(text), preview)
     if not text:
         logger.error("Draft from snippet: GPT вернул пустой completion")
+    related_context = _get_related_context(user_id, title, limit=20)
+    if related_context and related_context not in text:
+        text = _insert_after_source_line(text, related_context)
+    verification_line = _source_verification_line(url, from_telegram=from_telegram)
+    if verification_line and verification_line not in text:
+        text = f"{text.rstrip()}\n\n{verification_line}".strip()
+    ok_quality, quality_reason = _assess_draft_quality(text)
+    if not ok_quality:
+        logger.warning(
+            "weak draft detected reason=%s url=%s",
+            quality_reason,
+            (url or "")[:300],
+        )
+        warn_line = "⚡ Редактор: черновик требует проверки — возможно мало фактуры"
+        if warn_line not in text:
+            text = f"{text.rstrip()}\n\n{warn_line}".strip()
     if len(text) > MAX_POST_CHARS:
         text = text[: MAX_POST_CHARS - 1] + "…"
     return text
@@ -1441,7 +1944,7 @@ def create_draft_from_search(
     if merged_excl and logger.isEnabledFor(logging.DEBUG):
         sample = ", ".join(sorted(merged_excl)[:12])
         logger.debug("Draft creation excluded URLs sample: %s", sample[:500])
-    picked = _pick_draft_item(agent, prefs, merged_excl)
+    picked = _pick_draft_item(agent, prefs, user_id, merged_excl)
     if not picked:
         if mode == "tg":
             return (
@@ -1452,8 +1955,10 @@ def create_draft_from_search(
             )
         return False, "Ничего подходящего не нашёл — расширь темы в /editor_prefs или попробуй позже 🔎", None
     topics = prefs.get(PREF_TOPICS) or "новости"
+    deadline_h = draft_deadline_hours_from_prefs(prefs)
     body = draft_post_from_snippet(
         agent,
+        user_id,
         picked.title,
         picked.snippet,
         picked.url,
@@ -1468,7 +1973,13 @@ def create_draft_from_search(
         picked.from_telegram,
     )
     ch = prefs.get(PREF_CHANNEL) or DEFAULT_EDITOR_CHANNEL_ID
-    ok, res = insert_draft(user_id, ch, body, picked.url)
+    ok, res = insert_draft(
+        user_id,
+        ch,
+        body,
+        picked.url,
+        deadline_hours=deadline_h,
+    )
     if not ok:
         return False, str(res), None
     row = get_draft(user_id, int(res))

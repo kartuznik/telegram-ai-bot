@@ -19,7 +19,7 @@ from aiogram.exceptions import (
 )
 from aiohttp import ClientError
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.admin import (
     NO_ADMIN_RIGHTS,
@@ -47,18 +47,22 @@ from app.content_editor import (
     PREF_AUTO_DISABLED_REASON,
     PREF_AUTO_ENABLED,
     auto_interval_hours_from_prefs,
+    draft_deadline_hours_from_prefs,
     append_reject_hint,
+    extract_tg_channel_username_from_url,
     MAX_PENDING_UNAPPROVED_DRAFTS,
     build_editor_keyboard,
     bump_approve,
     count_drafts,
     create_draft_from_search,
     draft_dm_text,
+    build_voice_examples_overlay,
     format_auto_interval_label,
     format_editor_info_text,
     get_draft,
     get_oldest_draft,
     get_pending_edit,
+    is_draft_expired,
     get_source_mode,
     hint_for_reject_from_draft,
     init_content_editor_defaults,
@@ -70,6 +74,7 @@ from app.content_editor import (
     maybe_note_shorter_edit,
     migrate_strip_vesti_reject_hints,
     parse_auto_directive_from_rest,
+    parse_deadline_directive_from_rest,
     parse_editor_callback,
     parse_editor_extra_directives,
     pop_pending_edit,
@@ -103,6 +108,7 @@ from app.config import load_config
 from app.middlewares.admin_auth import AdminAuthMiddleware
 from app.middlewares.ban_check import BanCheckMiddleware
 from app.statistics import (
+    bump_channel_quality,
     get_daily_breakdown,
     get_stats,
     get_top_users,
@@ -183,6 +189,25 @@ _DRAFT_TRIGGER_WORDS = ("в канал", "пост", "черновик", "draft"
 _FILE_DRAFT_CONTEXT_TTL_SEC = 180.0
 _recent_user_text_for_draft: dict[int, tuple[str, float, int]] = {}
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+EXPIRED_APPROVE_YES = "editor_expired_yes"
+EXPIRED_APPROVE_NO = "editor_expired_no"
+
+
+def _expired_approve_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Да, публикуем",
+                    callback_data=f"{EXPIRED_APPROVE_YES}:{draft_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Нет, отменить",
+                    callback_data=f"{EXPIRED_APPROVE_NO}:{draft_id}",
+                ),
+            ]
+        ]
+    )
 
 
 async def _switch_telegram_to_direct_session(bot: Bot) -> None:
@@ -515,10 +540,12 @@ async def _create_editor_draft_from_text(
         f"Краткое содержание: {(content_text or '').strip()[:12000]}\n"
         f"URL: {(source_url or 'файл пользователя')}\n"
     )
+    voice_overlay = build_voice_examples_overlay(uid, limit=3)
     try:
         draft_text = await asyncio.to_thread(
             agent.run_raw_completion,
             system=DRAFT_SYSTEM
+            + voice_overlay
             + "\nЕсли URL отсутствует, в строке «Источник:» укажи «файл пользователя».\n",
             user=user_block,
             max_tokens=1200,
@@ -540,7 +567,15 @@ async def _create_editor_draft_from_text(
             body = f"{body.rstrip()}\n\n{source_line}"
 
     ch = prefs.get(PREF_CHANNEL) or DEFAULT_EDITOR_CHANNEL_ID
-    ok, res = await asyncio.to_thread(insert_draft, uid, ch, body, source_url)
+    deadline_h = draft_deadline_hours_from_prefs(prefs)
+    ok, res = await asyncio.to_thread(
+        insert_draft,
+        uid,
+        ch,
+        body,
+        source_url,
+        deadline_hours=deadline_h,
+    )
     if not ok:
         await message.answer(str(res))
         return False
@@ -661,8 +696,10 @@ async def editor_prefs_cmd(message: Message) -> None:
         ac = prefs.get(PREF_APPROVE_COUNT, "0")
         ae = "включён" if is_auto_enabled_pref(prefs) else "выключен"
         ah = auto_interval_hours_from_prefs(prefs)
+        dh = draft_deadline_hours_from_prefs(prefs)
         reason = (prefs.get(PREF_AUTO_DISABLED_REASON) or "").strip()
         extra = f"\nАвто-поиск черновиков: {ae}, интервал {format_auto_interval_label(ah)}"
+        extra += f"\nСрок жизни черновика: {dh} ч"
         if reason and not is_auto_enabled_pref(prefs):
             extra += f" (остановка: {reason[:120]}{'…' if len(reason) > 120 else ''})"
         await message.answer(
@@ -676,7 +713,8 @@ async def editor_prefs_cmd(message: Message) -> None:
             "Источники: /editor_prefs источники:both (или web, tg)\n"
             "Старый стиль: /editor_prefs биткоин,defi — темы и уточнение одной строкой\n"
             "Сброс отказов/банов по каналам: /editor_reset_rejects\n"
-            "Авто: /editor_prefs авто:0.5 (30 минут), /editor_prefs авто:1 (1 час) или /editor_prefs авто:off"
+            "Авто: /editor_prefs авто:0.5 (30 минут), /editor_prefs авто:1 (1 час) или /editor_prefs авто:off\n"
+            "Дедлайн: /editor_prefs дедлайн:24 (или 48, 72)"
         )
         return
 
@@ -710,8 +748,16 @@ async def editor_prefs_cmd(message: Message) -> None:
             "Не разобрал «авто». Примеры: авто:0.5 — раз в 30 минут, авто:1 — раз в час, авто:off — выключить автодобычу черновиков 🧪"
         )
         return
+    deadline_cleaned, deadline_updates = parse_deadline_directive_from_rest(auto_cleaned)
+    if (
+        deadline_updates is None
+        and re.search(r"(?is)дедлайн\s*:", auto_cleaned)
+        and "дедлайн:" in auto_cleaned.lower()
+    ):
+        await message.answer("Не разобрал «дедлайн». Примеры: дедлайн:24, дедлайн:48, дедлайн:72 ⏳")
+        return
 
-    rest_topics = (auto_cleaned if auto_updates is not None else extra_clean).strip()
+    rest_topics = (deadline_cleaned if deadline_updates is not None else auto_cleaned).strip()
 
     if auto_updates:
         was_auto = is_auto_enabled_pref(prefs_before)
@@ -733,6 +779,8 @@ async def editor_prefs_cmd(message: Message) -> None:
             await message.answer(
                 "Авто-поиск выключен — черновики только по твоему /drafts, без самодеятельности 📎✋"
             )
+    if deadline_updates:
+        memory.update_style_preferences(uid, deadline_updates)
 
     bits: list[str] = []
     if extra_updates:
@@ -775,6 +823,8 @@ async def editor_prefs_cmd(message: Message) -> None:
             bits.append(f"авто {format_auto_interval_label(auto_interval_hours_from_prefs(prefs))}")
         else:
             bits.append("авто выкл")
+    if deadline_updates:
+        bits.append(f"дедлайн {draft_deadline_hours_from_prefs(prefs)} ч")
     if not bits:
         await message.answer("Нечего менять — глянь /editor_prefs без хвоста для сводки 📋")
         return
@@ -802,7 +852,7 @@ async def editor_info_cmd(message: Message) -> None:
         return
     uid = message.from_user.id
     prefs = memory.get_style_preferences(uid)
-    await message.answer(format_editor_info_text(prefs))
+    await message.answer(format_editor_info_text(prefs, user_id=uid))
 
 
 @router.message(Command("drafts"))
@@ -1675,6 +1725,47 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             )
         return
 
+    if data.startswith(f"{EXPIRED_APPROVE_YES}:") or data.startswith(f"{EXPIRED_APPROVE_NO}:"):
+        parts = data.split(":", 1)
+        if len(parts) != 2:
+            await callback.message.answer("Кнопка подтверждения устарела — набери /drafts ✍️")
+            return
+        action, sid = parts
+        try:
+            did = int(sid)
+        except ValueError:
+            await callback.message.answer("Кнопка подтверждения протухла — набери /drafts ✍️")
+            return
+        if action == EXPIRED_APPROVE_NO:
+            await callback.message.answer("Окей, отменяем публикацию этого устаревшего черновика 👌")
+            return
+        row = get_draft(user_id, did)
+        if not row or str(row.get("status")) not in {"draft", "expired"}:
+            await callback.message.answer("Этот черновик уже не ждёт решения — /drafts для новой заготовки 📋")
+            return
+        ch_id = int(str(row["channel_id"]))
+        body = str(row.get("content") or "")
+        try:
+            await bot.send_message(
+                chat_id=ch_id,
+                text=body,
+                disable_web_page_preview=False,
+            )
+        except TelegramBadRequest as exc:
+            logger.warning("editor: публикация просроченного черновика: %s", exc)
+            set_draft_status(user_id, did, "failed")
+            await callback.message.answer(
+                f"Не вышло запостить в канал: {exc}. Проверь права бота (публикация сообщений) и id канала ✍️"
+            )
+            return
+        set_draft_status(user_id, did, "posted", set_approved_at=True)
+        bump_approve(memory, user_id)
+        src_ch = extract_tg_channel_username_from_url(str(row.get("source_url") or ""))
+        if src_ch:
+            bump_channel_quality(src_ch, approved_inc=1)
+        await callback.message.answer("Публикую несмотря на возраст новости — пост ушёл в канал ✅")
+        return
+
     if is_editor_callback(data):
         act, did = parse_editor_callback(data)
         if not act or did is None:
@@ -1686,12 +1777,20 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             )
             return
         row = get_draft(user_id, did)
-        if not row or str(row.get("status")) != "draft":
+        if not row or str(row.get("status")) not in {"draft", "expired"}:
             await callback.message.answer("Этот черновик уже не ждёт решения — /drafts для новой заготовки 📋")
             return
         ch_id = int(str(row["channel_id"]))
         body = str(row.get("content") or "")
         if act == "a":
+            if is_draft_expired(row):
+                if str(row.get("status")) != "expired":
+                    set_draft_status(user_id, did, "expired")
+                await callback.message.answer(
+                    "Этой новости уже 24+ часа — всё равно публикуем?",
+                    reply_markup=_expired_approve_keyboard(did),
+                )
+                return
             try:
                 await bot.send_message(
                     chat_id=ch_id,
@@ -1707,6 +1806,9 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
                 return
             set_draft_status(user_id, did, "posted", set_approved_at=True)
             bump_approve(memory, user_id)
+            src_ch = extract_tg_channel_username_from_url(str(row.get("source_url") or ""))
+            if src_ch:
+                bump_channel_quality(src_ch, approved_inc=1)
             await callback.message.answer(
                 "Пост улетел в @kriptogeograph — ты на режиссёре, я на суфлёре 🎬✅"
             )
@@ -1748,6 +1850,9 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
         if act == "r":
             set_draft_status(user_id, did, "rejected")
             append_reject_hint(memory, user_id, hint_for_reject_from_draft(row))
+            src_ch = extract_tg_channel_username_from_url(str(row.get("source_url") or ""))
+            if src_ch:
+                bump_channel_quality(src_ch, rejected_inc=1)
             await callback.message.answer(
                 "Записал отказ в мою «чёрную маленькую тетрадь» подбора — в следующий раз уйду чуть в сторону 📝❌"
             )

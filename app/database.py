@@ -97,10 +97,22 @@ def init_db() -> None:
                     status TEXT NOT NULL DEFAULT 'draft',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     approved_at TIMESTAMP,
-                    media_url TEXT
+                    media_url TEXT,
+                    expires_at TIMESTAMP,
+                    was_edited INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            cols = {
+                str(r[1])
+                for r in conn.execute("PRAGMA table_info(draft_posts)").fetchall()
+            }
+            if "expires_at" not in cols:
+                conn.execute("ALTER TABLE draft_posts ADD COLUMN expires_at TIMESTAMP")
+            if "was_edited" not in cols:
+                conn.execute(
+                    "ALTER TABLE draft_posts ADD COLUMN was_edited INTEGER NOT NULL DEFAULT 0"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_draft_posts_user_status "
                 "ON draft_posts(user_id, status)"
