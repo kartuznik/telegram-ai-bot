@@ -112,6 +112,17 @@ WEB_PROMO_DOMAINS = (
     # В запрос Tavily добавляем доменное исключение; путь /sponsored отдельно не поддерживается через -site:.
     "ign.com",
 )
+# Блокировка source_url для любого источника (web и TG), не только через -site: в Tavily.
+SOURCE_BLOCK_DOMAINS = frozenset(
+    {
+        "tiktok.com",
+        "vm.tiktok.com",
+        "store.steampowered.com",
+        "epicgames.com",
+        "apps.apple.com",
+        "play.google.com",
+    }
+)
 TRUSTED_DOMAINS = frozenset(
     {
         "ria.ru",
@@ -1273,6 +1284,30 @@ def _host(url: str) -> str:
         return ""
 
 
+def _is_blocked_source_domain(url: str) -> bool:
+    """True, если host URL совпадает с записью из SOURCE_BLOCK_DOMAINS или является её поддоменом / родителем в списке."""
+    raw = _host(url)
+    if not raw:
+        return False
+    host = raw.split(":", 1)[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return False
+    if host in SOURCE_BLOCK_DOMAINS:
+        return True
+    for blocked in SOURCE_BLOCK_DOMAINS:
+        if host.endswith(f".{blocked}"):
+            return True
+    parts = host.split(".")
+    if len(parts) >= 2:
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[i:])
+            if parent in SOURCE_BLOCK_DOMAINS:
+                return True
+    return False
+
+
 def _reject_host_key_for_url(url: str) -> str:
     """Ключ счётчика отказов: обычный сайт — домен (vesti.ru); посты Telegram — tg:username, не t.me."""
     u = (url or "").strip().lower()
@@ -1836,7 +1871,7 @@ def _pick_draft_item(
         )
     ranked.sort(key=lambda x: (x[0], x[1], x[2]))
 
-    n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = 0
+    n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = n_blocked_source = 0
     for (
         soft_pen,
         _score_sort,
@@ -1871,6 +1906,10 @@ def _pick_draft_item(
                 rj_key,
                 _host(url) or "?",
             )
+            continue
+        if _is_blocked_source_domain(url):
+            n_blocked_source += 1
+            logger.debug("skip blocked_source_domain url=%s", url[:500])
             continue
         title = (c.get("title") or "").strip() or "Без заголовка"
         content = (c.get("snippet") or "").strip()
@@ -1942,12 +1981,13 @@ def _pick_draft_item(
     else:
         logger.warning(
             "Pick draft: ни один кандидат не подошёл (mode=%s, n=%s excluded=%s hard_host=%s "
-            "url_reject=%s kw=%s no_url=%s)",
+            "url_reject=%s blocked_source=%s kw=%s no_url=%s)",
             mode,
             len(candidates),
             n_excluded,
             n_hard_host,
             n_url_rej,
+            n_blocked_source,
             n_kw,
             n_no_url,
         )

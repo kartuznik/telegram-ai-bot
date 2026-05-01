@@ -1323,6 +1323,14 @@ async def text_handler(message: Message, bot: Bot) -> None:
                 asyncio.create_task(
                     asyncio.to_thread(maybe_distill_editorial_rules_sync, agent, uid)
                 )
+                await message.answer(
+                    "Принял твой комментарий к решению по черновику — учту в подборе и тоне следующих постов 📝✅"
+                )
+            else:
+                await message.answer(
+                    "Не вышло сохранить комментарий — глюк на линии. Можешь написать ещё раз одним сообщением или продолжить с /drafts 📎"
+                )
+            return
 
     wants_url_draft, found_url = _should_create_draft_from_url_text(message)
     if wants_url_draft and found_url:
