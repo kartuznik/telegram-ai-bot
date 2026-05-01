@@ -13,6 +13,8 @@ from aiogram.types import (
 if TYPE_CHECKING:
     from aiogram import Bot
 
+from app.health_check import OWNER_RESTART_USER_ID
+
 logger = logging.getLogger(__name__)
 
 CALLBACK_START_HELP = "show_help"
@@ -37,16 +39,26 @@ def build_user_bot_commands() -> list[BotCommand]:
     ]
 
 
+def build_health_bot_commands() -> list[BotCommand]:
+    """Команды мониторинга для меню (setMyCommands)."""
+    return [
+        BotCommand(command="status", description="Проверка здоровья бота"),
+        BotCommand(command="restart", description="Перезапуск бота (только владелец)"),
+    ]
+
+
 def build_admin_bot_commands() -> list[BotCommand]:
     """Полное меню для ADMIN_ID (пользовательские + служебные)."""
     return build_user_bot_commands() + [
         BotCommand(command="stats", description="[Админ] Статистика бота"),
         BotCommand(command="admin", description="[Админ] Панель администратора"),
-        BotCommand(command="selftest", description="[Админ] Самодиагностика"),
+        BotCommand(command="selftest", description="[Админ] Самодиагностика (функции)"),
+        BotCommand(command="fulldiag", description="[Админ] Полная диагностика"),
         BotCommand(command="broadcast", description="[Админ] Рассылка всем"),
         BotCommand(command="ban", description="[Админ] Забанить user_id"),
         BotCommand(command="unban", description="[Админ] Разбанить user_id"),
         BotCommand(command="users", description="[Админ] Список пользователей"),
+        *build_health_bot_commands(),
     ]
 
 
@@ -55,23 +67,44 @@ async def setup_bot_command_menu(bot: "Bot", admin_id: int | None) -> None:
     user_cmds = build_user_bot_commands()
     await bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
     logger.info("Commands set: %s user commands for all users (BotCommandScopeDefault)", len(user_cmds))
-    if admin_id is None:
-        logger.warning("ADMIN_ID not set — отдельное меню админа через BotCommandScopeChat не настроено")
-        return
     admin_cmds = build_admin_bot_commands()
-    try:
-        await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=admin_id))
-        logger.info(
-            "Commands set: %s admin commands for ADMIN_ID=%s (BotCommandScopeChat)",
-            len(admin_cmds),
-            admin_id,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Не удалось установить команды для админа ADMIN_ID=%s: %s (чат с ботом должен существовать)",
-            admin_id,
-            exc,
-        )
+
+    if admin_id is not None:
+        try:
+            await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=admin_id))
+            logger.info(
+                "Commands set: %s admin commands for ADMIN_ID=%s (BotCommandScopeChat)",
+                len(admin_cmds),
+                admin_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось установить команды для админа ADMIN_ID=%s: %s (чат с ботом должен существовать)",
+                admin_id,
+                exc,
+            )
+    else:
+        logger.warning("ADMIN_ID not set — расширенное меню админа через BotCommandScopeChat не настроено")
+
+    # Владелец /restart может не совпадать с ADMIN_ID — отдельное меню в его ЛС.
+    owner_cmds = build_user_bot_commands() + build_health_bot_commands()
+    if OWNER_RESTART_USER_ID != admin_id:
+        try:
+            await bot.set_my_commands(
+                owner_cmds,
+                scope=BotCommandScopeChat(chat_id=OWNER_RESTART_USER_ID),
+            )
+            logger.info(
+                "Commands set: %s commands for owner user_id=%s (BotCommandScopeChat)",
+                len(owner_cmds),
+                OWNER_RESTART_USER_ID,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось установить команды для владельца user_id=%s: %s (нужна личка с ботом)",
+                OWNER_RESTART_USER_ID,
+                exc,
+            )
 
 
 # Текст справки без «жёстко зашитого» списка команд — список собирается в build_help_text.
@@ -97,7 +130,7 @@ _HELP_USER_COMMANDS = (
 )
 
 _HELP_ADMIN_COMMANDS = (
-    "🔐 [Админ] /stats /admin /selftest /broadcast /ban /unban /users\n\n"
+    "🔐 [Админ] /stats /admin /selftest /fulldiag /broadcast /ban /unban /users /status /restart\n\n"
 )
 
 _HELP_MIDDLE = (
@@ -121,7 +154,7 @@ _HELP_MIDDLE = (
     "• /editor_prefs биткоин,defi — по-прежнему можно одной строкой без слова «темы»\n"
     "• /editor_prefs источники:both — web (Tavily), tg (t.me/s), both (по умолчанию both); для web нужен TAVILY_API_KEY\n"
     "• /editor_info — сводка настроек; /editor_reset_rejects — сброс отказов и жёстких банов по сайту или tg:каналу\n"
-    "• /editor_prefs авто:24 — авто-поиск черновиков примерно раз в 24 часа (число можно менять 1–168); "
+    "• /editor_prefs авто:0.5 — авто-поиск черновиков примерно раз в 30 минут (также можно авто:1, авто:24 и т.д. до 168); "
     "авто:off — только ручной /drafts\n"
     "• /drafts — очередь черновиков: покажу самый старый на решение; пусто — подберу новый; "
     "/drafts ещё — добавить ещё один материал в очередь (лимит неапрувнутых в коде, сейчас 6) ✅✏️❌\n"

@@ -6,7 +6,7 @@ from aiogram.types import TelegramObject
 from app.admin import NO_ADMIN_RIGHTS, is_admin
 
 ADMIN_COMMANDS = frozenset(
-    {"admin", "broadcast", "ban", "unban", "users", "stats", "selftest"}
+    {"admin", "broadcast", "ban", "unban", "users", "stats", "selftest", "fulldiag"}
 )
 
 

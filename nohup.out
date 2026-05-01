@@ -1,0 +1,27 @@
+INFO:app.content_editor:content_editor: дефолтные TG-каналы: rian_ru,readovkanews,meduzalive,tass_agency,thebell_io
+INFO:app.llm_agent:OpenAI клиент: прокси настроен (SOCKS5 185.168.248.3:8000)
+INFO:app.llm_agent:Модель: chat_temperature=0.75, vision_temperature=0.38
+INFO:app.llm_agent:Tavily: API ключ задан (timeout_base=36s, max_retries=2, backoff_mult=2.0)
+INFO:app.llm_agent:Консьерж: включён
+DEBUG:asyncio:Using selector: EpollSelector
+INFO:__main__:Запуск бота, PID=25264
+INFO:__main__:База данных инициализирована: bot_database.db
+INFO:__main__:База статистики инициализирована: bot_statistics.db
+INFO:__main__:Админка: таблица банов готова (bot_statistics.db)
+INFO:app.telegram_ui:Commands set: 13 user commands for all users (BotCommandScopeDefault)
+INFO:app.telegram_ui:Commands set: 23 admin commands for ADMIN_ID=504425191 (BotCommandScopeChat)
+INFO:__main__:Auto-search: background task scheduled (task=<Task pending name='Task-6' coro=<run_content_editor_autofetch_loop() running at /home/kuzya/telegram-ai-bot/app/content_editor_background.py:52>>)
+INFO:__main__:Self-diagnostics: background task scheduled (task=<Task pending name='Task-7' coro=<SelfDiagnostics.auto_diagnostics_loop() running at /home/kuzya/telegram-ai-bot/app/self_diagnostics.py:214>> notify_chat_id=504425191)
+INFO:aiogram.dispatcher:Start polling
+INFO:app.content_editor_background:Auto-search: starting (interval between ticks=900s)
+INFO:app.content_editor_background:content_editor autofetch: loop entered (same as Auto-search)
+DEBUG:app.content_editor_background:content_editor autofetch: user_id=504425191 следующий проход через ~2163s
+INFO:app.self_diagnostics:self_diagnostics: auto loop started interval=1800.0s notify_chat_id=504425191
+INFO:aiogram.dispatcher:Run polling for bot @so_many_many_bot id=8605764376 - 'качество в количестве'
+WARNING:aiogram.dispatcher:Received SIGINT signal
+INFO:aiogram.dispatcher:Polling stopped for bot @so_many_many_bot id=8605764376 - 'качество в количестве'
+INFO:aiogram.dispatcher:Polling stopped
+INFO:app.self_diagnostics:self_diagnostics: auto loop cancelled
+INFO:app.content_editor_background:Auto-search: stopped (cancelled)
+INFO:app.content_editor_background:content_editor autofetch: loop cancelled
+INFO:__main__:Бот остановлен корректно

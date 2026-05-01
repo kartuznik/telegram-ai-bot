@@ -18,6 +18,19 @@ from app.memory import ChatMemory
 
 logger = logging.getLogger(__name__)
 
+try:
+    from app.news_bot_patterns import match_categories, score_text
+
+    USE_PATTERNS = True
+except ImportError:
+    USE_PATTERNS = False
+
+    def match_categories(text: str) -> dict[str, list[str]]:
+        return {}
+
+    def score_text(text: str) -> dict[str, int]:
+        return {}
+
 # Канал @kriptogeograph (v1 — константа; позже можно вынести в config)
 DEFAULT_EDITOR_CHANNEL_ID = "-1001985473246"
 MAX_POST_CHARS = 1000
@@ -41,8 +54,8 @@ PREF_SOURCE_MODE = "content_editor_source_mode"
 PREF_TG_CHANNELS = "content_editor_tg_channels"
 PREF_HOST_REJECT_COUNTS = "content_editor_reject_host_counts"
 
-DEFAULT_AUTO_INTERVAL_HOURS = 24
-MIN_AUTO_INTERVAL_HOURS = 1
+DEFAULT_AUTO_INTERVAL_HOURS = 0.5
+MIN_AUTO_INTERVAL_HOURS = 0.5
 MAX_AUTO_INTERVAL_HOURS = 168
 # Максимум черновиков в статусе draft на пользователя (ручной /drafts, авто-поиск, insert).
 MAX_PENDING_UNAPPROVED_DRAFTS = 6
@@ -51,7 +64,7 @@ _EXCLUDE_POSTED_DAYS = 14
 _EXCLUDE_REJECTED_DAYS = 7
 
 AUTO_DIRECTIVE_RE = re.compile(
-    r"(?is)(?<!\S)авто\s*:\s*(\d{1,3}|off|выкл|0)\b",
+    r"(?is)(?<!\S)авто\s*:\s*((?:\d{1,3}(?:[.,]\d+)?|off|выкл|0))\b",
 )
 SOURCES_MODE_RE = re.compile(r"(?is)(?<!\S)источники\s*:\s*(web|tg|both)\b")
 # «тканалы» — частая опечатка вместо «тгканалы» (без буквы г).
@@ -150,12 +163,94 @@ _FINANCE_TOPIC_SUBSTRINGS = (
     "wti",
 )
 
+_FINANCE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "крипта": (
+        "биткоин",
+        "bitcoin",
+        "крипт",
+        "crypt",
+        "эфир",
+        "ethereum",
+        "defi",
+        "токен",
+        "блокчейн",
+        "blockchain",
+        "nft",
+        "ico",
+        "майнинг",
+        "web3",
+        "бинанс",
+        "binance",
+    ),
+    "финансы": (
+        "инвест",
+        "трейд",
+        "trading",
+        "акци",
+        "облигац",
+        "ipo",
+        "бирж",
+        "форекс",
+        "forex",
+        "фьючерс",
+        "маржа",
+        "котировк",
+        "дивиденд",
+        "etf",
+        "портфел",
+        "волатильн",
+    ),
+    "экономика": (
+        "эконом",
+        "инфляц",
+        "ввп",
+        "рецес",
+        "ставка цб",
+        "ключевой ставк",
+        "монетарн",
+        "макроэконом",
+        "нефть",
+        "brent",
+        "wti",
+    ),
+}
+
+
+def _detect_finance_categories(title: str, snippet: str) -> set[str]:
+    blob = f"{title} {snippet}".lower().replace("ё", "е")
+    categories: set[str] = set()
+    for cat, words in _FINANCE_CATEGORY_KEYWORDS.items():
+        if any(w in blob for w in words):
+            categories.add(cat)
+    return categories
+
 
 def _draft_material_sounds_financial(topics: str, title: str, snippet: str) -> bool:
-    blob = f"{topics} {title} {snippet}".lower().replace("ё", "е")
+    # Критично: дисклеймер определяется по текущему материалу (title+snippet), а не по общим темам пользователя.
+    # Иначе нерелевантные посты (стриминг/игры) получают финансовую оговорку из-за старых "крипто" тем в prefs.
+    categories = _detect_finance_categories(title, snippet)
+    if categories:
+        logger.debug(
+            "Draft finance classifier: enabled categories=%s title=%r",
+            sorted(categories),
+            (title or "")[:120],
+        )
+        return True
+    # Фолбэк на старый список ключей, но только по материалу (без topics).
+    blob = f"{title} {snippet}".lower().replace("ё", "е")
     for w in _FINANCE_TOPIC_SUBSTRINGS:
         if w in blob:
+            logger.debug(
+                "Draft finance classifier: enabled by keyword=%r title=%r",
+                w,
+                (title or "")[:120],
+            )
             return True
+    logger.debug(
+        "Draft finance classifier: disabled title=%r snippet=%r",
+        (title or "")[:120],
+        (snippet or "")[:160],
+    )
     return False
 
 
@@ -175,9 +270,26 @@ def is_auto_enabled_pref(prefs: dict[str, str]) -> bool:
     return _truthy_pref(prefs.get(PREF_AUTO_ENABLED))
 
 
-def auto_interval_hours_from_prefs(prefs: dict[str, str]) -> int:
+def _fmt_hours_value(hours: float) -> str:
+    if float(hours).is_integer():
+        return str(int(hours))
+    return f"{hours:.2f}".rstrip("0").rstrip(".")
+
+
+def format_auto_interval_label(hours: float) -> str:
+    if hours < 1:
+        mins = int(round(hours * 60))
+        return f"~{mins} мин"
+    return f"~{_fmt_hours_value(hours)} ч"
+
+
+def auto_interval_hours_from_prefs(prefs: dict[str, str]) -> float:
     try:
-        h = int((prefs.get(PREF_AUTO_INTERVAL_HOURS) or str(DEFAULT_AUTO_INTERVAL_HOURS)).strip())
+        h = float(
+            (prefs.get(PREF_AUTO_INTERVAL_HOURS) or str(DEFAULT_AUTO_INTERVAL_HOURS))
+            .strip()
+            .replace(",", ".")
+        )
     except ValueError:
         h = DEFAULT_AUTO_INTERVAL_HOURS
     return max(MIN_AUTO_INTERVAL_HOURS, min(MAX_AUTO_INTERVAL_HOURS, h))
@@ -200,12 +312,12 @@ def parse_auto_directive_from_rest(rest: str) -> tuple[str, dict[str, str] | Non
         updates[PREF_AUTO_ENABLED] = "0"
     else:
         try:
-            h = int(raw)
+            h = float(raw.replace(",", "."))
         except ValueError:
             return s, None
         h = max(MIN_AUTO_INTERVAL_HOURS, min(MAX_AUTO_INTERVAL_HOURS, h))
         updates[PREF_AUTO_ENABLED] = "1"
-        updates[PREF_AUTO_INTERVAL_HOURS] = str(h)
+        updates[PREF_AUTO_INTERVAL_HOURS] = _fmt_hours_value(h)
         updates[PREF_AUTO_DISABLED_REASON] = ""
     return cleaned, updates
 
@@ -378,7 +490,7 @@ def format_editor_info_text(prefs: dict[str, str]) -> str:
         f"• Темы: {topics[:500]}{'…' if len(topics) > 500 else ''}\n"
         f"• Уточнение к поиску: {sources[:500]}{'…' if len(sources) > 500 else ''}\n\n"
         f"• Авто-поиск: {auto}"
-        + (f", интервал ~{ah} ч" if auto_on else "")
+        + (f", интервал {format_auto_interval_label(ah)}" if auto_on else "")
         + "\n\n"
         "Команды настройки (можно смешивать в одной строке):\n"
         "• темы: … или темы … — только темы и уточнение (через запятую после первой темы);\n"
@@ -720,10 +832,43 @@ def _topics_pair_from_capture(raw: str) -> tuple[str, str]:
     t = (raw or "").strip()
     if not t:
         return "", ""
-    if "," in t:
-        a, _, b = t.partition(",")
-        return a.strip()[:800], b.strip()[:800]
+    # В /editor_prefs директива "темы:" должна сохранять весь CSV как список тем.
+    # Уточнение к поиску задаётся отдельной директивой "источники:", а не хвостом после первой запятой.
     return t[:800], ""
+
+
+def _normalize_user_topics(raw_topics: str) -> list[str]:
+    parts = re.split(r"[,\n;|/]+", (raw_topics or "").strip())
+    out: list[str] = []
+    for p in parts:
+        topic = p.strip().lower().replace("ё", "е")
+        topic = re.sub(r"\s+", " ", topic)
+        if topic and topic not in out:
+            out.append(topic)
+    return out
+
+
+def _score_matches_user_topics(
+    score_map: dict[str, int], user_topics: list[str], post_text_low: str
+) -> tuple[bool, str]:
+    if not score_map or not user_topics:
+        return False, "no_score_or_topics"
+    score_categories = [k.lower().replace("ё", "е") for k in score_map.keys()]
+    for ut in user_topics:
+        if ut in score_categories:
+            return True, f"user_topic_eq_category:{ut}"
+        for cat in score_categories:
+            if ut in cat or cat in ut:
+                return True, f"user_topic_partial_category:{ut}->{cat}"
+    # "стримы" -> twitch and similar topical aliases via post text relevance
+    if any("twitch" in c for c in score_categories):
+        for ut in user_topics:
+            if any(x in ut for x in ("стрим", "твич", "stream", "twitch")):
+                return True, f"user_topic_stream_alias:{ut}"
+    for ut in user_topics:
+        if ut and ut in post_text_low:
+            return True, f"user_topic_in_post_text:{ut}"
+    return False, "score_no_topic_match"
 
 
 def reset_editor_reject_state(memory: ChatMemory, user_id: int) -> tuple[int, int]:
@@ -991,6 +1136,7 @@ def _pick_draft_item(
     excl_raw = {(u or "").strip().lower() for u in (excluded_urls or set())}
     excl_norm = {_norm_cmp_url(u).lower() for u in (excluded_urls or set()) if u}
     topics = (prefs.get(PREF_TOPICS) or "актуальные новости").strip()
+    user_topics = _normalize_user_topics(topics)
     sources = (prefs.get(PREF_SOURCES) or "").strip()
     rejects = _reject_list(prefs)
     reject_urls, hard_hosts, soft_hosts, kw_strings = _build_reject_filters(rejects, prefs)
@@ -1068,21 +1214,44 @@ def _pick_draft_item(
     if not candidates:
         return None
 
-    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    ranked: list[tuple[int, int, int, dict[str, Any], str, dict[str, int], dict[str, list[str]]]] = []
     for i, c in enumerate(candidates):
         url = (c.get("url") or "").strip()
         host = _host(url).replace("www.", "")
         soft_pen = 1 if host and host in soft_hosts else 0
         if soft_pen:
             logger.debug("Pick draft: мягкий приоритет host=%s (не бан, сортировка)", host)
-        ranked.append((soft_pen, i, c))
-    ranked.sort(key=lambda x: (x[0], x[1]))
+        title = (c.get("title") or "").strip()
+        content = (c.get("snippet") or "").strip()
+        post_text = f"{title} {content}".strip()
+        post_text_low = post_text.lower()
+        cat_matches: dict[str, list[str]] = {}
+        score_map: dict[str, int] = {}
+        pattern_reason = ""
+        total_score = 0
+        if USE_PATTERNS:
+            try:
+                score_map = score_text(post_text)
+                cat_matches = match_categories(post_text)
+                total_score = sum(score_map.values())
+                _, pattern_reason = _score_matches_user_topics(
+                    score_map, user_topics, post_text_low
+                )
+            except Exception as exc:
+                logger.debug("Pick draft: patterns runtime fallback reason=%s", exc)
+                pattern_reason = "patterns_runtime_error"
+                score_map = {}
+                cat_matches = {}
+                total_score = 0
+        ranked.append((soft_pen, -total_score, i, c, pattern_reason, score_map, cat_matches))
+    ranked.sort(key=lambda x: (x[0], x[1], x[2]))
 
     n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = 0
-    for soft_pen, _idx, c in ranked:
+    for soft_pen, _score_sort, _idx, c, pattern_reason, score_map, cat_matches in ranked:
         url = (c.get("url") or "").strip()
         if not url:
             n_no_url += 1
+            logger.debug("Pick draft: skip no_url")
             continue
         u_low = url.lower()
         cu = _norm_cmp_url(url).lower()
@@ -1106,24 +1275,43 @@ def _pick_draft_item(
         title = (c.get("title") or "").strip() or "Без заголовка"
         content = (c.get("snippet") or "").strip()
         blob = (title + " " + content).lower()
-        matched_bad = ""
+        pattern_accept = False
+        pattern_info = pattern_reason
+        if USE_PATTERNS:
+            pattern_accept, pattern_info = _score_matches_user_topics(score_map, user_topics, blob)
+            logger.debug(
+                "Pick draft: patterns evaluate url=%r accept=%s reason=%s scores=%s categories=%s",
+                url[:100],
+                pattern_accept,
+                pattern_info,
+                score_map,
+                list(cat_matches.keys()),
+            )
         skip_kw = False
-        for bad in kw_strings:
-            if bad and len(bad) > 2 and "." not in bad and bad.lower() in blob:
-                skip_kw = True
-                matched_bad = bad[:60]
-                break
-        if skip_kw:
-            n_kw += 1
-            logger.debug("Pick draft: skip keyword %r", matched_bad)
-            continue
+        if USE_PATTERNS:
+            if not pattern_accept:
+                n_kw += 1
+                logger.debug("Pick draft: skip patterns_not_relevant reason=%s", pattern_info)
+                continue
+        else:
+            matched_bad = ""
+            for bad in kw_strings:
+                if bad and len(bad) > 2 and "." not in bad and bad.lower() in blob:
+                    skip_kw = True
+                    matched_bad = bad[:60]
+                    break
+            if skip_kw:
+                n_kw += 1
+                logger.debug("Pick draft: skip keyword %r", matched_bad)
+                continue
         logger.info(
-            "Pick draft: выбран url=%r reject_key=%s netloc=%s tg=%s soft_penalty=%s",
+            "Pick draft: выбран url=%r reject_key=%s netloc=%s tg=%s soft_penalty=%s total_score=%s",
             url[:120],
             rj_key or "?",
             _host(url) or "?",
             c.get("from_tg"),
             soft_pen,
+            sum(score_map.values()) if USE_PATTERNS else 0,
         )
         return DraftPick(
             title=title,

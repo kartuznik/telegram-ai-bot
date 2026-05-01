@@ -32,6 +32,7 @@ from app.admin import (
 )
 from app.content_editor import (
     AUTO_DIRECTIVE_RE,
+    DRAFT_SYSTEM,
     DEFAULT_EDITOR_CHANNEL_ID,
     PREF_APPROVE_COUNT,
     PREF_AUTO_INTRO_SENT,
@@ -53,6 +54,7 @@ from app.content_editor import (
     count_drafts,
     create_draft_from_search,
     draft_dm_text,
+    format_auto_interval_label,
     format_editor_info_text,
     get_draft,
     get_oldest_draft,
@@ -60,6 +62,7 @@ from app.content_editor import (
     get_source_mode,
     hint_for_reject_from_draft,
     init_content_editor_defaults,
+    insert_draft,
     is_auto_enabled_pref,
     is_editor_callback,
     is_editor_enabled,
@@ -88,8 +91,14 @@ from app.scenario_simulator import (
     put_session,
     run_scenario_expand,
 )
-from app.selftest import BotSelfTest
 from app.database import init_db
+from app.health_check import (
+    OWNER_RESTART_USER_ID,
+    attach_self_diagnostics,
+    restart_process,
+    router as health_check_router,
+)
+from app.self_diagnostics import SelfDiagnostics, install_diagnostics_heartbeat_middleware
 from app.config import load_config
 from app.middlewares.admin_auth import AdminAuthMiddleware
 from app.middlewares.ban_check import BanCheckMiddleware
@@ -102,7 +111,10 @@ from app.statistics import (
 )
 from app.llm_agent import LLMAgent
 from app.memory import ChatMemory
-from app.proxy_utils import socks5_proxy_url_from_config
+from app.proxy_utils import (
+    socks5_proxy_url_from_config,
+    telegram_socks5_proxy_url_from_config,
+)
 from app.pdf_extractor import extract_text_from_pdf, extract_text_from_txt
 from app.telegram_ui import (
     CALLBACK_START_HELP,
@@ -149,18 +161,29 @@ from app.user_templates import (
 )
 
 
-logging.basicConfig(level=logging.DEBUG)
+config = load_config()
+logging.basicConfig(level=getattr(logging, config.log_level, logging.INFO))
 logger = logging.getLogger(__name__)
 
-config = load_config()
 memory = ChatMemory(max_messages=config.max_history_messages)
 init_content_editor_defaults(config)
 migrate_strip_vesti_reject_hints(memory)
 agent = LLMAgent(config=config, memory=memory)
 
+_self_diagnostics = SelfDiagnostics(
+    config=config,
+    agent=agent,
+    restart_process=restart_process,
+)
+attach_self_diagnostics(_self_diagnostics)
+
 router = Router()
 
 _telegram_direct_fallback_applied = False
+_DRAFT_TRIGGER_WORDS = ("в канал", "пост", "черновик", "draft", "в редактор")
+_FILE_DRAFT_CONTEXT_TTL_SEC = 180.0
+_recent_user_text_for_draft: dict[int, tuple[str, float, int]] = {}
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
 async def _switch_telegram_to_direct_session(bot: Bot) -> None:
@@ -216,7 +239,7 @@ async def safe_send_chat_action(
 
     if (
         config.telegram_proxy_fallback_direct
-        and socks5_proxy_url_from_config(config)
+        and telegram_socks5_proxy_url_from_config(config)
         and not _telegram_direct_fallback_applied
     ):
         try:
@@ -231,10 +254,46 @@ async def safe_send_chat_action(
 
 def build_telegram_session() -> AiohttpSession | None:
     # Proxy applies only to Telegram API requests.
-    proxy_url = socks5_proxy_url_from_config(config)
+    proxy_url = telegram_socks5_proxy_url_from_config(config)
     if not proxy_url:
+        logger.info("Telegram: direct connection")
         return None
+    host = (config.telegram_proxy_host or "").strip()
+    port = (config.telegram_proxy_port or "1080").strip()
+    logger.info("Telegram: proxy %s:%s", host, port)
     return AiohttpSession(proxy=proxy_url)
+
+
+async def ensure_bot_identity(bot: Bot) -> None:
+    delays = (5, 6, 7, 8)
+    last_exc: BaseException | None = None
+    for attempt in range(1, 6):
+        try:
+            await bot.get_me()
+            if attempt > 1:
+                logger.info("bot.get_me(): успешно на попытке %s/5", attempt)
+            return
+        except TelegramConflictError:
+            raise
+        except (TelegramNetworkError, ClientError, TimeoutError, OSError) as exc:
+            last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+
+        if attempt < 5:
+            delay = delays[attempt - 1]
+            logger.warning(
+                "bot.get_me(): попытка %s/5 неуспешна (%s). Повтор через %ss",
+                attempt,
+                last_exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    logger.error("bot.get_me(): все 5 попыток неуспешны, завершаю запуск")
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("bot.get_me(): startup failed after 5 attempts")
 
 
 async def _send_templates_list(message: Message, user_id: int) -> None:
@@ -379,6 +438,177 @@ async def _editor_require_private(message: Message) -> bool:
     return True
 
 
+def _contains_draft_trigger(text: str) -> bool:
+    low = (text or "").lower().strip()
+    return any(word in low for word in _DRAFT_TRIGGER_WORDS)
+
+
+def _remember_recent_user_text(message: Message) -> None:
+    if not message.from_user or not message.text:
+        return
+    txt = (message.text or "").strip()
+    if not txt or txt.startswith("/"):
+        return
+    _recent_user_text_for_draft[message.from_user.id] = (
+        txt,
+        time.time(),
+        message.chat.id,
+    )
+
+
+def _trigger_from_recent_text(user_id: int, chat_id: int) -> tuple[bool, str]:
+    row = _recent_user_text_for_draft.get(user_id)
+    if not row:
+        return False, ""
+    txt, ts, cid = row
+    if cid != chat_id or (time.time() - ts) > _FILE_DRAFT_CONTEXT_TTL_SEC:
+        return False, ""
+    if _contains_draft_trigger(txt):
+        return True, txt
+    return False, ""
+
+
+def _should_create_draft_from_file_message(message: Message) -> tuple[bool, str]:
+    if not message.from_user:
+        return False, ""
+    uid = message.from_user.id
+    if not is_editor_enabled(memory, uid):
+        return False, ""
+    caption = (message.caption or "").strip()
+    if _contains_draft_trigger(caption):
+        return True, caption
+    trig, src = _trigger_from_recent_text(uid, message.chat.id)
+    if trig:
+        return True, src
+    return False, ""
+
+
+def _extract_document_text(file_name: str, mime_type: str, file_bytes: bytes) -> tuple[str, str | None]:
+    name = (file_name or "").lower()
+    mt = (mime_type or "").lower()
+    try:
+        if name.endswith(".pdf") or mt == "application/pdf":
+            return extract_text_from_pdf(file_bytes), None
+        if name.endswith(".txt") or mt.startswith("text/plain"):
+            return extract_text_from_txt(file_bytes), None
+        if name.endswith(".md") or mt in {"text/markdown", "text/x-markdown"}:
+            return extract_text_from_txt(file_bytes), None
+    except Exception as exc:
+        return "", f"Не получилось обработать файл 😥\n{exc}"
+    return "", "Поддерживаются только PDF, TXT и MD файлы 🙏"
+
+
+async def _create_editor_draft_from_text(
+    message: Message,
+    content_text: str,
+    source_label: str,
+    *,
+    source_url: str | None = None,
+) -> bool:
+    if not message.from_user:
+        return False
+    uid = message.from_user.id
+    prefs = memory.get_style_preferences(uid)
+    topics = (prefs.get(PREF_TOPICS) or "актуальные новости").strip()
+    user_block = (
+        f"Темы пользователя: {topics}\n"
+        f"Заголовок источника: {source_label}\n"
+        f"Краткое содержание: {(content_text or '').strip()[:12000]}\n"
+        f"URL: {(source_url or 'файл пользователя')}\n"
+    )
+    try:
+        draft_text = await asyncio.to_thread(
+            agent.run_raw_completion,
+            system=DRAFT_SYSTEM
+            + "\nЕсли URL отсутствует, в строке «Источник:» укажи «файл пользователя».\n",
+            user=user_block,
+            max_tokens=1200,
+            temperature=min(0.82, getattr(agent, "_chat_temperature", 0.75) + 0.05),
+        )
+    except Exception as exc:
+        logger.exception("draft_from_file: GPT generation failed: %s", exc)
+        await message.answer("Не удалось подготовить черновик из файла 😥 Попробуй ещё раз чуть позже.")
+        return False
+
+    body = (draft_text or "").strip()
+    if not body:
+        await message.answer("Файл прочитал, но черновик не собрался — попробуй другой файл или добавь больше контекста 🙏")
+        return False
+
+    if source_url:
+        source_line = f"Источник: {source_url}".strip()
+        if source_line.lower() not in body.lower():
+            body = f"{body.rstrip()}\n\n{source_line}"
+
+    ch = prefs.get(PREF_CHANNEL) or DEFAULT_EDITOR_CHANNEL_ID
+    ok, res = await asyncio.to_thread(insert_draft, uid, ch, body, source_url)
+    if not ok:
+        await message.answer(str(res))
+        return False
+
+    row = get_draft(uid, int(res))
+    if not row:
+        await message.answer("Черновик создался, но не читается из базы — попробуй /drafts 🔧")
+        return False
+
+    await message.answer(
+        draft_dm_text(row),
+        reply_markup=build_editor_keyboard(int(res)),
+    )
+    return True
+
+
+def _extract_first_url_from_text(text: str) -> str | None:
+    m = _URL_RE.search(text or "")
+    if not m:
+        return None
+    url = m.group(0).strip().rstrip(").,!?;:\"'")
+    return url or None
+
+
+def _fetch_article_text_by_url(url: str) -> tuple[str, str | None]:
+    if not getattr(agent, "tavily", None):
+        return "", "Веб-поиск сейчас недоступен: в этом режиме нужен Tavily (TAVILY_API_KEY) 🌐"
+    result = agent._tavily_search(url, max_results=3)
+    if not result or not isinstance(result, dict):
+        return "", "Не смог открыть ссылку через веб-поиск — попробуй другую ссылку или повтори позже."
+    items = result.get("results") or []
+    if not isinstance(items, list) or not items:
+        return "", "По этой ссылке не удалось получить содержимое статьи."
+
+    selected = None
+    url_low = url.lower()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        item_url = str(it.get("url") or "").strip().lower()
+        if item_url and (item_url == url_low or url_low in item_url or item_url in url_low):
+            selected = it
+            break
+    if selected is None:
+        selected = items[0] if isinstance(items[0], dict) else None
+    if not selected:
+        return "", "По ссылке вернулся пустой результат."
+
+    content = (selected.get("raw_content") or "").strip()
+    if not content:
+        content = (selected.get("content") or "").strip()
+    if not content:
+        return "", "Страница открылась, но текст извлечь не удалось."
+    return content[:12000], None
+
+
+def _should_create_draft_from_url_text(message: Message) -> tuple[bool, str | None]:
+    if not message.from_user or not message.text:
+        return False, None
+    if not is_editor_enabled(memory, message.from_user.id):
+        return False, None
+    txt = (message.text or "").strip()
+    if not _contains_draft_trigger(txt):
+        return False, None
+    return True, _extract_first_url_from_text(txt)
+
+
 @router.message(Command("editor_start"))
 async def editor_start_cmd(message: Message) -> None:
     if not await _editor_require_private(message) or not message.from_user:
@@ -396,7 +626,7 @@ async def editor_start_cmd(message: Message) -> None:
         f"Редактор включён 🎉 Цель — канал @kriptogeograph (`{DEFAULT_EDITOR_CHANNEL_ID}`). "
         "Дальше: /editor_prefs биткоин,defi — темы и уточнение через запятую, потом /drafts — "
         "принесу черновик с кнопками ✅✏️❌. Хочешь, чтобы я сам иногда приносил черновики — "
-        "/editor_prefs авто:24 (раз в сутки, часы настраиваются). В канал без тебя ничего не уйдёт — "
+        "/editor_prefs авто:0.5 (раз в 30 минут, интервал настраивается). В канал без тебя ничего не уйдёт — "
         "только после ✅ «Опубликовать» 🎯"
     )
 
@@ -433,7 +663,7 @@ async def editor_prefs_cmd(message: Message) -> None:
         ae = "включён" if is_auto_enabled_pref(prefs) else "выключен"
         ah = auto_interval_hours_from_prefs(prefs)
         reason = (prefs.get(PREF_AUTO_DISABLED_REASON) or "").strip()
-        extra = f"\nАвто-поиск черновиков: {ae}, интервал ~{ah} ч"
+        extra = f"\nАвто-поиск черновиков: {ae}, интервал {format_auto_interval_label(ah)}"
         if reason and not is_auto_enabled_pref(prefs):
             extra += f" (остановка: {reason[:120]}{'…' if len(reason) > 120 else ''})"
         await message.answer(
@@ -447,7 +677,7 @@ async def editor_prefs_cmd(message: Message) -> None:
             "Источники: /editor_prefs источники:both (или web, tg)\n"
             "Старый стиль: /editor_prefs биткоин,defi — темы и уточнение одной строкой\n"
             "Сброс отказов/банов по каналам: /editor_reset_rejects\n"
-            "Авто: /editor_prefs авто:24 или /editor_prefs авто:off"
+            "Авто: /editor_prefs авто:0.5 (30 минут), /editor_prefs авто:1 (1 час) или /editor_prefs авто:off"
         )
         return
 
@@ -478,7 +708,7 @@ async def editor_prefs_cmd(message: Message) -> None:
     auto_cleaned, auto_updates = parse_auto_directive_from_rest(extra_clean)
     if auto_updates is None and re.search(r"(?is)авто\s*:", extra_clean) and not AUTO_DIRECTIVE_RE.search(extra_clean):
         await message.answer(
-            "Не разобрал «авто». Примеры: авто:24 — раз в 24 часа, авто:off — выключить автодобычу черновиков 🧪"
+            "Не разобрал «авто». Примеры: авто:0.5 — раз в 30 минут, авто:1 — раз в час, авто:off — выключить автодобычу черновиков 🧪"
         )
         return
 
@@ -543,7 +773,7 @@ async def editor_prefs_cmd(message: Message) -> None:
     prefs = memory.get_style_preferences(uid)
     if auto_updates:
         if is_auto_enabled_pref(prefs):
-            bits.append(f"авто ~{auto_interval_hours_from_prefs(prefs)} ч")
+            bits.append(f"авто {format_auto_interval_label(auto_interval_hours_from_prefs(prefs))}")
         else:
             bits.append("авто выкл")
     if not bits:
@@ -744,8 +974,8 @@ ADMIN_HELP = (
     "• /ban <user_id> — заблокировать пользователя\n"
     "• /unban <user_id> — разблокировать\n"
     "• /users — список пользователей (до 50)\n"
-    "• /selftest — самодиагностика: шаблоны, якоря, консьерж, БД, ключи API, JSON-кнопки "
-    "(отчёт в чат, в логах INFO по каждому пункту) 🤖✨\n"
+    "• /selftest — функциональная самодиагностика (шаблоны, якоря, консьерж, БД, ключи, JSON-кнопки)\n"
+    "• /fulldiag — полная: техника + функционал 🤖✨\n"
     "• /admin — это меню"
 )
 
@@ -756,17 +986,6 @@ async def admin_cmd(message: Message) -> None:
         await message.answer(NO_ADMIN_RIGHTS)
         return
     await message.answer(ADMIN_HELP)
-
-
-@router.message(Command("selftest"))
-async def selftest_cmd(message: Message) -> None:
-    if not message.from_user or not is_admin(message.from_user.id):
-        await message.answer(NO_ADMIN_RIGHTS)
-        return
-    tester = BotSelfTest(config=config, agent=agent)
-    results = tester.run_all()
-    report = tester.format_report(results)
-    await message.answer(report)
 
 
 @router.message(Command("broadcast"))
@@ -879,6 +1098,7 @@ async def text_handler(message: Message, bot: Bot) -> None:
     if not message.from_user or not message.text:
         return
     log_user_message(message.from_user.id, message.from_user.username)
+    _remember_recent_user_text(message)
     uid = message.from_user.id
     text = message.text
 
@@ -887,6 +1107,24 @@ async def text_handler(message: Message, bot: Bot) -> None:
         if pe is not None:
             await _handle_editor_revision_message(message, pe)
             return
+
+    wants_url_draft, found_url = _should_create_draft_from_url_text(message)
+    if wants_url_draft and found_url:
+        await message.answer("Читаю статью, готовлю черновик... ⏳")
+        article_text, err = await asyncio.to_thread(_fetch_article_text_by_url, found_url)
+        if err:
+            await message.answer(err)
+            return
+        await _create_editor_draft_from_text(
+            message,
+            article_text,
+            source_label=f"статья по ссылке {found_url}",
+            source_url=found_url,
+        )
+        return
+    if wants_url_draft and not found_url:
+        await message.answer("Вижу триггер для черновика, но не нашёл ссылку в сообщении. Добавь URL вида https://... 🔗")
+        return
 
     am, areason, atitle = classify_anchor_command(text)
     if am:
@@ -1064,7 +1302,28 @@ async def document_handler(message: Message, bot: Bot) -> None:
 
     document = message.document
     mime_type = (document.mime_type or "").lower()
+    wants_draft, trigger_src = _should_create_draft_from_file_message(message)
     if mime_type in {"image/jpeg", "image/png", "image/gif"}:
+        if wants_draft:
+            await message.answer("Читаю файл, готовлю черновик... ⏳")
+            cap = (message.caption or "").strip()
+            question = cap if cap else "Опиши содержимое изображения для черновика поста."
+            analysis = await _analyze_image_file(
+                bot=bot,
+                file_id=document.file_id,
+                question=question,
+                default_suffix=".jpg",
+                user_id=message.from_user.id,
+            )
+            if not analysis:
+                await message.answer("Не удалось прочитать изображение для черновика 😥")
+                return
+            await _create_editor_draft_from_text(
+                message,
+                analysis,
+                source_label=f"изображение (триггер: {trigger_src[:80]})",
+            )
+            return
         cap = (message.caption or "").strip()
         question = cap if cap else "Что на этом изображении? Опиши подробно."
         memory_user_text = (
@@ -1080,22 +1339,34 @@ async def document_handler(message: Message, bot: Bot) -> None:
         )
         return
 
+    if wants_draft:
+        await message.answer("Читаю файл, готовлю черновик... ⏳")
+        filename = document.file_name or ""
+        buffer = BytesIO()
+        await bot.download(document, destination=buffer)
+        extracted, err = _extract_document_text(filename, mime_type, buffer.getvalue())
+        if err:
+            await message.answer(err)
+            return
+        if not extracted.strip():
+            await message.answer("В файле не найден текст для черновика 🤷")
+            return
+        await _create_editor_draft_from_text(
+            message,
+            extracted,
+            source_label=f"файл {filename or 'без названия'} (триггер: {trigger_src[:80]})",
+        )
+        return
+
     await safe_send_chat_action(bot, message.chat.id, "typing")
     filename = (document.file_name or "").lower()
     buffer = BytesIO()
     await bot.download(document, destination=buffer)
     file_bytes = buffer.getvalue()
 
-    try:
-        if filename.endswith(".pdf"):
-            extracted = extract_text_from_pdf(file_bytes)
-        elif filename.endswith(".txt"):
-            extracted = extract_text_from_txt(file_bytes)
-        else:
-            await message.answer("Поддерживаются только PDF и TXT файлы 🙏")
-            return
-    except Exception as exc:
-        await message.answer(f"Не получилось обработать файл 😥\n{exc}")
+    extracted, err = _extract_document_text(filename, mime_type, file_bytes)
+    if err:
+        await message.answer(err)
         return
 
     if not extracted:
@@ -1127,8 +1398,28 @@ async def photo_handler(message: Message, bot: Bot) -> None:
     if not message.from_user or not message.photo:
         return
     log_user_message(message.from_user.id, message.from_user.username)
+    wants_draft, trigger_src = _should_create_draft_from_file_message(message)
     best_photo = message.photo[-1]
     cap = (message.caption or "").strip()
+    if wants_draft:
+        await message.answer("Читаю файл, готовлю черновик... ⏳")
+        question = cap if cap else "Опиши содержимое изображения для черновика поста."
+        analysis = await _analyze_image_file(
+            bot=bot,
+            file_id=best_photo.file_id,
+            question=question,
+            default_suffix=".jpg",
+            user_id=message.from_user.id,
+        )
+        if not analysis:
+            await message.answer("Не удалось прочитать фото для черновика 😥")
+            return
+        await _create_editor_draft_from_text(
+            message,
+            analysis,
+            source_label=f"фото (триггер: {trigger_src[:80]})",
+        )
+        return
     question = cap if cap else "Что на этом изображении? Опиши подробно."
     memory_user_text = (
         f"[Изображение] {cap}" if cap else "[Изображение] Без подписи — разбор содержимого."
@@ -1152,6 +1443,43 @@ async def _handle_image_message(
     memory_user_text: str,
     default_suffix: str,
 ) -> None:
+    analysis = await _analyze_image_file(
+        bot=bot,
+        file_id=file_id,
+        question=question,
+        default_suffix=default_suffix,
+        user_id=message.from_user.id if message.from_user else 0,
+    )
+    if not analysis:
+        await message.answer("Не удалось проанализировать изображение 😥")
+        return
+    fail_text = "Не удалось проанализировать изображение"
+    if message.from_user and analysis.strip() and analysis.strip() != fail_text:
+        memory.save_user_memory(
+            message.from_user.id, memory_user_text, analysis.strip()
+        )
+        logger.info(
+            "История: сохранён ответ по изображению для user_id=%s",
+            message.from_user.id,
+        )
+    buttons = resolve_proactive_buttons(
+        message.from_user.id if message.from_user else 0,
+        analysis,
+        None,
+        True,
+        user_query=question,
+    )
+    await send_ai_reply(message, analysis, buttons)
+
+
+async def _analyze_image_file(
+    *,
+    bot: Bot,
+    file_id: str,
+    question: str,
+    default_suffix: str,
+    user_id: int,
+) -> str:
     temp_file_path = ""
     try:
         file_info = await bot.get_file(file_id)
@@ -1165,10 +1493,9 @@ async def _handle_image_message(
             raw = image_file.read()
         mime_type = guessed_mime or "image/jpeg"
         image_data_url = f"data:{mime_type};base64,{base64.b64encode(raw).decode('utf-8')}"
-        uid = message.from_user.id if message.from_user else 0
-        img_seq = memory.count_user_image_messages(uid) + 1
+        img_seq = memory.count_user_image_messages(user_id) + 1
         dialogue_ctx = (
-            memory.build_vision_history_context(uid)
+            memory.build_vision_history_context(user_id)
             if img_seq > 1
             else None
         )
@@ -1178,26 +1505,10 @@ async def _handle_image_message(
             image_sequence=img_seq,
             dialogue_context=dialogue_ctx,
         )
-        fail_text = "Не удалось проанализировать изображение"
-        if message.from_user and analysis.strip() and analysis.strip() != fail_text:
-            memory.save_user_memory(
-                message.from_user.id, memory_user_text, analysis.strip()
-            )
-            logger.info(
-                "История: сохранён ответ по изображению для user_id=%s",
-                message.from_user.id,
-            )
-        buttons = resolve_proactive_buttons(
-            message.from_user.id if message.from_user else 0,
-            analysis,
-            None,
-            True,
-            user_query=question,
-        )
-        await send_ai_reply(message, analysis, buttons)
+        return (analysis or "").strip()
     except Exception as exc:
         logger.exception("Ошибка обработки изображения: %s", exc)
-        await message.answer("Не удалось проанализировать изображение 😥")
+        return ""
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             try:
@@ -1400,6 +1711,40 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             await callback.message.answer(
                 "Пост улетел в @kriptogeograph — ты на режиссёре, я на суфлёре 🎬✅"
             )
+            pending_after = count_drafts(user_id, "draft")
+            logger.info(
+                "editor approve: user_id=%s draft_id=%s pending_after=%s",
+                user_id,
+                did,
+                pending_after,
+            )
+            if pending_after > 0:
+                next_row = get_oldest_draft(user_id, "draft")
+                if next_row:
+                    extra = (
+                        f"\n\nВ очереди после этого ещё {pending_after - 1} черновик(ов). "
+                        f"Хочешь добавить свежий в хвост — /drafts ещё (до {MAX_PENDING_UNAPPROVED_DRAFTS} шт.) 📎"
+                        if pending_after > 1
+                        else "\n\nЭто был предпоследний: после него останется пусто. "
+                        "Если захочешь ещё материал — /drafts ещё 🚀"
+                    )
+                    await callback.message.answer(
+                        draft_dm_text(next_row) + extra,
+                        reply_markup=build_editor_keyboard(int(next_row["id"])),
+                    )
+                return
+            prefs_after = memory.get_style_preferences(user_id)
+            if is_auto_enabled_pref(prefs_after):
+                await callback.message.answer(
+                    "Очередь теперь пустая, но я уже грею моторы 🤖⚡ "
+                    "Следующий черновик подъедет сам по авто-режиму. "
+                    "Не хочешь ждать — жми /drafts, принесу вручную."
+                )
+            else:
+                await callback.message.answer(
+                    "Очередь чистая как лист бумаги 🧼📝 "
+                    "Жми /drafts — и закину следующий материал на разбор."
+                )
             return
         if act == "r":
             set_draft_status(user_id, did, "rejected")
@@ -1558,11 +1903,13 @@ async def main() -> None:
         bot = Bot(token=config.telegram_token)
 
     dp = Dispatcher()
+    install_diagnostics_heartbeat_middleware(dp, _self_diagnostics)
     dp.message.middleware(BanCheckMiddleware())
     dp.message.middleware(AdminAuthMiddleware())
+    dp.include_router(health_check_router)
     dp.include_router(router)
     try:
-        await bot.get_me()
+        await ensure_bot_identity(bot)
         await setup_bot_command_menu(bot, config.admin_id)
     except TelegramConflictError:
         logger.warning("Другая копия бота уже запущена")
@@ -1577,9 +1924,34 @@ async def main() -> None:
         "Auto-search: background task scheduled (task=%r)",
         autofetch_task,
     )
+    diag_notify = (
+        config.admin_id
+        if config.admin_id is not None
+        else (OWNER_RESTART_USER_ID if OWNER_RESTART_USER_ID else None)
+    )
+    _self_diagnostics.bind_dispatcher(dp)
+    diag_task = asyncio.create_task(
+        _self_diagnostics.auto_diagnostics_loop(bot, diag_notify, 1800.0)
+    )
+    logger.info(
+        "Self-diagnostics: background task scheduled (task=%r notify_chat_id=%s)",
+        diag_task,
+        diag_notify,
+    )
+    _self_diagnostics.mark_user_activity()
     try:
-        await dp.start_polling(bot)
+        while True:
+            await _self_diagnostics.run_long_polling(bot)
+            if not _self_diagnostics.consume_pending_poll_restart():
+                break
+            await _self_diagnostics.complete_stuck_poll_recovery(bot, diag_notify)
+            _self_diagnostics.schedule_poll_restarted_notice(bot, diag_notify)
     finally:
+        diag_task.cancel()
+        try:
+            await diag_task
+        except asyncio.CancelledError:
+            pass
         autofetch_task.cancel()
         try:
             await autofetch_task

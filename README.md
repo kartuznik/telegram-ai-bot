@@ -115,10 +115,14 @@ python main.py
 | `TAVILY_API_KEY` | Нет | Ключ [Tavily](https://tavily.com/) для веб-поиска и черновиков в режиме `web`/`both`. Без ключа диалог работает, но поиск и редактор в режиме только web — нет. |
 | `ADMIN_ID` | Нет | Числовой Telegram user ID админа. Нужен для `/admin`, `/selftest`, `/broadcast`, банов. Узнать ID: [@userinfobot](https://t.me/userinfobot) или raw-данные апдейта. |
 | `PROXY_HOST` | Нет | SOCKS5 для **OpenAI** (и клиента на httpx). Пример: `127.0.0.1` или хост VPS-прокси. |
-| `PROXY_PORT` | Нет | Порт SOCKS5, часто `1080`. |
-| `PROXY_USERNAME` | Нет | Логин прокси, если требуется. |
-| `PROXY_PASSWORD` | Нет | Пароль прокси. |
-| `TELEGRAM_PROXY_FALLBACK_DIRECT` | Нет | `1` / `true` — при сбоях Telegram через прокси один раз переключить сессию бота на прямое подключение к api.telegram.org (OpenAI по-прежнему через `PROXY_*`). |
+| `PROXY_PORT` | Нет | Порт SOCKS5 для OpenAI, часто `1080`. |
+| `PROXY_USERNAME` | Нет | Логин OpenAI-прокси, если требуется. |
+| `PROXY_PASSWORD` | Нет | Пароль OpenAI-прокси. |
+| `TELEGRAM_PROXY_HOST` | Нет | Отдельный SOCKS5 для **Telegram Bot API**. Если пусто — Telegram идёт напрямую (рекомендуется для VPS в Европе). |
+| `TELEGRAM_PROXY_PORT` | Нет | Порт Telegram-прокси, часто `1080`. |
+| `TELEGRAM_PROXY_USERNAME` | Нет | Логин Telegram-прокси, если требуется. |
+| `TELEGRAM_PROXY_PASSWORD` | Нет | Пароль Telegram-прокси. |
+| `TELEGRAM_PROXY_FALLBACK_DIRECT` | Нет | `1` / `true` — при сбоях Telegram через `TELEGRAM_PROXY_*` один раз переключить сессию на прямое подключение к api.telegram.org. |
 | `LOG_LEVEL` | Нет | Уровень логирования: `DEBUG` / `INFO` / `WARNING` / `ERROR`. По умолчанию `INFO`. |
 | `CONCIERGE_ENABLED` | Нет | `0` / `false` — отключить логику консьержа. По умолчанию включён. |
 | `MODEL_TEMPERATURE` | Нет | Температура чата, диапазон в коде 0.5–0.9, по умолчанию `0.75`. |

@@ -160,6 +160,27 @@ BUTTONS_USER_REMINDER = (
 
 logger = logging.getLogger(__name__)
 
+
+def _log_openai_chat_completion_usage(response: object) -> None:
+    """Логирует usage из ответа chat.completions (оценка стоимости для gpt-4o-mini)."""
+    if not hasattr(response, "usage") or not response.usage:
+        return
+    usage = response.usage
+    prompt = usage.prompt_tokens
+    completion = usage.completion_tokens
+    total = usage.total_tokens
+    # Примерная стоимость для gpt-4o-mini ($0.15/1M input, $0.60/1M output)
+    cost = (prompt * 0.00015 + completion * 0.0006) / 1000  # в долларах
+    cost_rub = cost * 90  # примерный курс
+    logger.info(
+        "🪙 TOKENS: prompt=%s, completion=%s, total=%s, cost≈%.2f₽",
+        prompt,
+        completion,
+        total,
+        cost_rub,
+    )
+
+
 # Множитель таймаута между попытками (лестница при базе из config, верхняя граница 120 с в SDK Tavily).
 _TAVILY_TIMEOUT_ATTEMPT_FACTOR = 1.5
 
@@ -750,6 +771,7 @@ class LLMAgent:
                     ],
                     temperature=self._chat_temperature,
                 )
+                _log_openai_chat_completion_usage(completion)
                 answer = (completion.choices[0].message.content or "").strip()
                 clean_text, buttons, is_generic = self._extract_buttons(answer)
                 if not skip_concierge_tracking:
@@ -770,6 +792,29 @@ class LLMAgent:
                     time.sleep(attempt)
                     continue
             except APIStatusError as exc:
+                err_type = None
+                err_code = None
+                err_message = None
+                try:
+                    payload = None
+                    if getattr(exc, "response", None) is not None:
+                        payload = exc.response.json()
+                    if isinstance(payload, dict):
+                        err_obj = payload.get("error")
+                        if isinstance(err_obj, dict):
+                            err_type = err_obj.get("type")
+                            err_code = err_obj.get("code")
+                            err_message = err_obj.get("message")
+                except Exception:
+                    logger.debug("OpenAI APIStatusError: не удалось распарсить JSON тела", exc_info=True)
+
+                logger.error(
+                    "OpenAI APIStatusError: status=%s, type=%s, code=%s, message=%s",
+                    exc.status_code,
+                    err_type or "-",
+                    err_code or "-",
+                    (err_message or str(exc) or "-")[:1000],
+                )
                 if exc.status_code == 421 and attempt < max_attempts:
                     time.sleep(attempt)
                     continue
@@ -868,6 +913,7 @@ class LLMAgent:
                 ],
                 temperature=self._vision_temperature,
             )
+            _log_openai_chat_completion_usage(completion)
             answer = (completion.choices[0].message.content or "").strip()
             logger.info("Vision: анализ завершён, %s символов", len(answer))
             return answer or "Не удалось проанализировать изображение"
@@ -1009,6 +1055,7 @@ class LLMAgent:
             temperature=temp,
             max_tokens=max_tokens,
         )
+        _log_openai_chat_completion_usage(completion)
         out = (completion.choices[0].message.content or "").strip()
         logger.info("run_raw_completion: %s символов ответа", len(out))
         return out

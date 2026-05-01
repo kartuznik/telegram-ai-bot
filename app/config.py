@@ -45,6 +45,14 @@ def _parse_float_env(name: str, default: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _parse_log_level_env(name: str, default: str = "INFO") -> str:
+    raw = os.getenv(name, "").strip().upper()
+    if not raw:
+        return default
+    allowed = {"DEBUG", "INFO", "WARNING", "ERROR"}
+    return raw if raw in allowed else default
+
+
 @dataclass
 class Config:
     telegram_token: str
@@ -54,12 +62,17 @@ class Config:
     proxy_port: str | None
     proxy_username: str | None
     proxy_password: str | None
+    telegram_proxy_host: str | None
+    telegram_proxy_port: str | None
+    telegram_proxy_username: str | None
+    telegram_proxy_password: str | None
     admin_id: int | None
     model_name: str = "gpt-4o"
     max_history_messages: int = 20
     chat_temperature: float = 0.75
     vision_temperature: float = 0.38
     concierge_enabled: bool = True
+    log_level: str = "INFO"
     telegram_proxy_fallback_direct: bool = False
     max_user_templates: int = 30
     max_user_anchors: int = 25
@@ -87,6 +100,10 @@ def load_config() -> Config:
     proxy_port = os.getenv("PROXY_PORT", "").strip() or None
     proxy_username = os.getenv("PROXY_USERNAME", "").strip() or None
     proxy_password = os.getenv("PROXY_PASSWORD", "").strip() or None
+    telegram_proxy_host = os.getenv("TELEGRAM_PROXY_HOST", "").strip() or None
+    telegram_proxy_port = os.getenv("TELEGRAM_PROXY_PORT", "").strip() or None
+    telegram_proxy_username = os.getenv("TELEGRAM_PROXY_USERNAME", "").strip() or None
+    telegram_proxy_password = os.getenv("TELEGRAM_PROXY_PASSWORD", "").strip() or None
 
     if not telegram_token:
         raise ValueError("TELEGRAM_BOT_TOKEN is missing in .env")
@@ -104,6 +121,7 @@ def load_config() -> Config:
     chat_temp = _parse_temperature("MODEL_TEMPERATURE", 0.75, 0.5, 0.9)
     vision_temp = _parse_temperature("VISION_MODEL_TEMPERATURE", 0.38, 0.15, 0.55)
     concierge_on = _parse_bool_env("CONCIERGE_ENABLED", True)
+    log_level = _parse_log_level_env("LOG_LEVEL", "INFO")
     telegram_proxy_fallback = _parse_bool_env("TELEGRAM_PROXY_FALLBACK_DIRECT", False)
     max_templates = _parse_int_env("MAX_USER_TEMPLATES", 30, 1, 100)
     max_anchors = _parse_int_env("MAX_USER_ANCHORS", 25, 1, 100)
@@ -124,10 +142,15 @@ def load_config() -> Config:
         proxy_port=proxy_port,
         proxy_username=proxy_username,
         proxy_password=proxy_password,
+        telegram_proxy_host=telegram_proxy_host,
+        telegram_proxy_port=telegram_proxy_port,
+        telegram_proxy_username=telegram_proxy_username,
+        telegram_proxy_password=telegram_proxy_password,
         admin_id=admin_id,
         chat_temperature=chat_temp,
         vision_temperature=vision_temp,
         concierge_enabled=concierge_on,
+        log_level=log_level,
         telegram_proxy_fallback_direct=telegram_proxy_fallback,
         max_user_templates=max_templates,
         max_user_anchors=max_anchors,
