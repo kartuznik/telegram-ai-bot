@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -1697,6 +1697,28 @@ def _snippet_from_tavily_item(it: dict[str, Any]) -> str:
     return ""
 
 
+_TAVILY_MAX_CANDIDATE_AGE_DAYS = 30
+
+
+def _tavily_published_utc(it: dict[str, Any]) -> datetime | None:
+    """Дата публикации из ответа Tavily (ISO) или None."""
+    pub = it.get("published_date") or it.get("published")
+    if not pub or not isinstance(pub, str):
+        return None
+    s = pub.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _freshness_terms_for_query(topics: str, sources: str) -> list[str]:
     """Ключевые слова свежести для Tavily в зависимости от языка темы."""
     text = f"{topics} {sources}".strip()
@@ -1754,18 +1776,30 @@ def _pick_draft_item(
             )
             result = agent._tavily_search(q[:400], max_results=6, days=5)
         if result and isinstance(result.get("results"), list):
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                days=_TAVILY_MAX_CANDIDATE_AGE_DAYS
+            )
             for it in result["results"]:
-                if isinstance(it, dict):
-                    candidates.append(
-                        {
-                            "title": (it.get("title") or "Без заголовка").strip(),
-                            "url": (it.get("url") or "").strip(),
-                            "snippet": _snippet_from_tavily_item(it)[:800],
-                            "from_tg": False,
-                            "tg_disp": "",
-                            "source_channel_username": "",
-                        }
+                if not isinstance(it, dict):
+                    continue
+                pub_dt = _tavily_published_utc(it)
+                if pub_dt is not None and pub_dt < cutoff:
+                    logger.debug(
+                        "skip tavily_old_news published=%s url=%s",
+                        it.get("published_date") or it.get("published"),
+                        (it.get("url") or "").strip(),
                     )
+                    continue
+                candidates.append(
+                    {
+                        "title": (it.get("title") or "Без заголовка").strip(),
+                        "url": (it.get("url") or "").strip(),
+                        "snippet": _snippet_from_tavily_item(it)[:800],
+                        "from_tg": False,
+                        "tg_disp": "",
+                        "source_channel_username": "",
+                    }
+                )
         else:
             logger.warning(
                 "Pick draft: web пустой или нет results (mode=%s, has_result=%s)",
