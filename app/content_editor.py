@@ -110,10 +110,10 @@ WEB_PROMO_DOMAINS = (
     "epicgames.com",
     "apps.apple.com",
     "play.google.com",
-    # В запрос Tavily добавляем доменное исключение; путь /sponsored отдельно не поддерживается через -site:.
+    # Промо/агрегаторы: передаём в Tavily как exclude_domains (не в текст запроса).
     "ign.com",
 )
-# Блокировка source_url для любого источника (web и TG), не только через -site: в Tavily.
+# Блокировка source_url для любого источника (web и TG); для web дублируется в Tavily exclude_domains.
 SOURCE_BLOCK_DOMAINS = frozenset(
     {
         "tiktok.com",
@@ -1728,10 +1728,6 @@ def _freshness_terms_for_query(topics: str, sources: str) -> list[str]:
     return ["today", "yesterday", "latest news", "breaking"]
 
 
-def _promo_domain_exclusion_terms() -> list[str]:
-    return [f"-site:{domain}" for domain in WEB_PROMO_DOMAINS]
-
-
 def _pick_draft_item(
     agent: LLMAgent,
     prefs: dict[str, str],
@@ -1756,25 +1752,36 @@ def _pick_draft_item(
     if mode in ("web", "both") and agent.tavily:
         freshness_terms = _freshness_terms_for_query(topics, sources)
         freshness_hint = " ".join(freshness_terms)
-        promo_exclusions = _promo_domain_exclusion_terms()
         now = datetime.utcnow()
         date_hint = f"{now.year}"
-        q = f"{topics} {sources} {freshness_hint} {date_hint} {' '.join(promo_exclusions)}".strip()
+        q = f"{topics} {sources} {freshness_hint} {date_hint}".strip()
+        promo_domains = list(WEB_PROMO_DOMAINS) + list(SOURCE_BLOCK_DOMAINS)
         logger.debug(
-            "Pick draft: web promo blacklist excluded domains=%s",
-            ", ".join(WEB_PROMO_DOMAINS),
+            "Pick draft: Tavily exclude_domains (%s): %s",
+            len(promo_domains),
+            ", ".join(promo_domains),
         )
         tail = _reject_hints_for_tavily_query(rejects)
         if tail:
             q += ". Исключай или обходи материалы, связанные с: " + ", ".join(tail)
-        result = agent._tavily_search(q[:400], max_results=6, days=2)
+        result = agent._tavily_search(
+            q[:400],
+            max_results=6,
+            days=2,
+            exclude_domains=promo_domains,
+        )
         result_items = result.get("results") if isinstance(result, dict) else None
         if isinstance(result_items, list) and len(result_items) == 0:
             logger.debug(
                 "Pick draft: Tavily вернул 0 результатов с days=2, fallback на days=5, query=%r",
                 q[:220],
             )
-            result = agent._tavily_search(q[:400], max_results=6, days=5)
+            result = agent._tavily_search(
+                q[:400],
+                max_results=6,
+                days=5,
+                exclude_domains=promo_domains,
+            )
         if result and isinstance(result.get("results"), list):
             cutoff = datetime.now(timezone.utc) - timedelta(
                 days=_TAVILY_MAX_CANDIDATE_AGE_DAYS
@@ -1946,7 +1953,11 @@ def _pick_draft_item(
             continue
         if _is_blocked_source_domain(url):
             n_blocked_source += 1
-            logger.debug("skip blocked_source_domain url=%s", url[:500])
+            raw_h = _host(url)
+            host = raw_h.split(":", 1)[0].lower()
+            if host.startswith("www."):
+                host = host[4:]
+            logger.debug("skip blocked_source_domain domain=%s url=%s", host, url[:200])
             continue
         title = (c.get("title") or "").strip() or "Без заголовка"
         content = (c.get("snippet") or "").strip()
