@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -1734,7 +1735,9 @@ def _pick_draft_item(
         freshness_terms = _freshness_terms_for_query(topics, sources)
         freshness_hint = " ".join(freshness_terms)
         promo_exclusions = _promo_domain_exclusion_terms()
-        q = f"{topics} {sources} {freshness_hint} {' '.join(promo_exclusions)}".strip()
+        now = datetime.utcnow()
+        date_hint = f"{now.year}"
+        q = f"{topics} {sources} {freshness_hint} {date_hint} {' '.join(promo_exclusions)}".strip()
         logger.debug(
             "Pick draft: web promo blacklist excluded domains=%s",
             ", ".join(WEB_PROMO_DOMAINS),
