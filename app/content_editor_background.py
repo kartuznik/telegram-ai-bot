@@ -108,7 +108,7 @@ async def _process_user_autofetch(bot: Bot, agent: LLMAgent, memory: ChatMemory,
         logger.debug("content_editor autofetch: user_id=%s на паузе", user_id)
         return
 
-    if reject_spree_should_pause(prefs):
+    if reject_spree_should_pause(user_id, prefs):
         until = time.time() + REJECT_PAUSE_SEC
         memory.update_style_preferences(user_id, {PREF_AUTO_PAUSED_UNTIL_TS: str(until)})
         logger.warning(

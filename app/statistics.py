@@ -284,8 +284,19 @@ def get_channel_quality_top_bottom(
                     "ratio": ratio,
                 }
             )
-        top = sorted(items, key=lambda x: (x["ratio"], x["approved_count"]), reverse=True)[: max(1, top_limit)]
-        bottom = sorted(items, key=lambda x: (x["ratio"], -x["rejected_count"]))[: max(1, bottom_limit)]
+        top_n = max(1, top_limit)
+        bot_n = max(1, bottom_limit)
+        top = sorted(
+            items,
+            key=lambda x: (x["ratio"], x["approved_count"], x["rejected_count"]),
+            reverse=True,
+        )[:top_n]
+        top_names = {x["channel_username"] for x in top}
+        rest = [x for x in items if x["channel_username"] not in top_names]
+        bottom = sorted(
+            rest,
+            key=lambda x: (x["ratio"], -x["rejected_count"], -x["approved_count"]),
+        )[:bot_n]
         return top, bottom
     except Exception as exc:
         logger.exception("Статистика: get_channel_quality_top_bottom: %s", exc)

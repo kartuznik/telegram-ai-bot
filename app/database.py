@@ -220,6 +220,32 @@ def get_recent_expired_urls(user_id: int | str, hours: int = 24) -> set[str]:
     return out
 
 
+def get_draft_feedback_rejected_approved_counts(user_id: int | str) -> tuple[int, int]:
+    """
+    Сколько раз пользователь оставил фидбек после явного отказа (rejected) и после апрува (approved).
+    «Устарело» (expired_content), правки и прочие action сюда не входят — для расчёта reject_spree.
+    """
+    uid = _uid_str(user_id)
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN LOWER(TRIM(action)) = 'rejected' THEN 1 ELSE 0 END), 0) AS r,
+                    COALESCE(SUM(CASE WHEN LOWER(TRIM(action)) = 'approved' THEN 1 ELSE 0 END), 0) AS a
+                FROM draft_feedback
+                WHERE user_id = ?
+                """,
+                (uid,),
+            ).fetchone()
+        if not row:
+            return 0, 0
+        return int(row["r"] or 0), int(row["a"] or 0)
+    except Exception as exc:
+        logger.exception("get_draft_feedback_rejected_approved_counts: %s", exc)
+        return 0, 0
+
+
 def get_pending_feedbacks(user_id: int | str, since_last_count: int) -> list[dict[str, Any]]:
     """
     Последние фидбеки пользователя (новые сверху), с OFFSET since_last_count.

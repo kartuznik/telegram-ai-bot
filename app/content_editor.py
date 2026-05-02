@@ -15,6 +15,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.config import Config
 from app.database import (
     get_connection,
+    get_draft_feedback_rejected_approved_counts,
     get_draft_feedback_slice,
     get_editorial_feedbacks_baseline,
     get_editorial_rules,
@@ -1050,9 +1051,19 @@ def is_auto_paused(prefs: dict[str, str]) -> bool:
     return time.time() < u
 
 
-def reject_spree_should_pause(prefs: dict[str, str]) -> bool:
-    rc = int(prefs.get(PREF_REJECT_COUNT, "0") or 0)
-    ac = int(prefs.get(PREF_APPROVE_COUNT, "0") or 0)
+def reject_spree_should_pause(user_id: int, prefs: dict[str, str]) -> bool:
+    """
+    Пауза авто-поиска при «перекосе» в сторону отказов.
+    Учитываются только явные отказы (фидбек action=rejected), не «Устарело» (expired_content).
+    Если ни одного фидбека rejected/approved ещё нет — сохраняем счётчики из prefs (клики ❌/✅ до ответа на «почему»).
+    """
+    rc_fb, ac_fb = get_draft_feedback_rejected_approved_counts(user_id)
+    rc_p = int(prefs.get(PREF_REJECT_COUNT, "0") or 0)
+    ac_p = int(prefs.get(PREF_APPROVE_COUNT, "0") or 0)
+    if rc_fb > 0 or ac_fb > 0:
+        rc, ac = rc_fb, ac_fb
+    else:
+        rc, ac = rc_p, ac_p
     return rc >= 8 and rc >= ac + 6
 
 
