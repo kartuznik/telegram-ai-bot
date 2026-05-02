@@ -323,6 +323,7 @@ class LLMAgent:
             logger.info("OpenAI клиент: прямое подключение (без прокси)")
 
         self.memory = memory
+        self.config = config
         self.model_name = config.model_name
         self._chat_temperature = config.chat_temperature
         self._vision_temperature = config.vision_temperature

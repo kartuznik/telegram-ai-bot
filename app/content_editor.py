@@ -114,17 +114,6 @@ WEB_PROMO_DOMAINS = (
     # Промо/агрегаторы: передаём в Tavily как exclude_domains (не в текст запроса).
     "ign.com",
 )
-# Блокировка source_url для любого источника (web и TG); для web дублируется в Tavily exclude_domains.
-SOURCE_BLOCK_DOMAINS = frozenset(
-    {
-        "tiktok.com",
-        "vm.tiktok.com",
-        "store.steampowered.com",
-        "epicgames.com",
-        "apps.apple.com",
-        "play.google.com",
-    }
-)
 TRUSTED_DOMAINS = frozenset(
     {
         "ria.ru",
@@ -1325,8 +1314,8 @@ def _host(url: str) -> str:
         return ""
 
 
-def _is_blocked_source_domain(url: str) -> bool:
-    """True, если host URL совпадает с записью из SOURCE_BLOCK_DOMAINS или является её поддоменом / родителем в списке."""
+def _is_blocked_source_domain(url: str, blocked_domains: frozenset[str]) -> bool:
+    """True, если host URL совпадает с записью из blocked_domains или является её поддоменом / родителем в списке."""
     raw = _host(url)
     if not raw:
         return False
@@ -1335,16 +1324,16 @@ def _is_blocked_source_domain(url: str) -> bool:
         host = host[4:]
     if not host:
         return False
-    if host in SOURCE_BLOCK_DOMAINS:
+    if host in blocked_domains:
         return True
-    for blocked in SOURCE_BLOCK_DOMAINS:
+    for blocked in blocked_domains:
         if host.endswith(f".{blocked}"):
             return True
     parts = host.split(".")
     if len(parts) >= 2:
         for i in range(1, len(parts)):
             parent = ".".join(parts[i:])
-            if parent in SOURCE_BLOCK_DOMAINS:
+            if parent in blocked_domains:
                 return True
     return False
 
@@ -1786,6 +1775,7 @@ def _pick_draft_item(
     rejects = _reject_list(prefs)
     reject_urls, hard_hosts, soft_hosts, kw_strings = _build_reject_filters(rejects, prefs)
     channel_quality = get_channel_quality_snapshot()
+    blocked_src = frozenset(agent.config.blocked_search_domains)
 
     candidates: list[dict[str, Any]] = []
 
@@ -1795,7 +1785,7 @@ def _pick_draft_item(
         now = datetime.utcnow()
         date_hint = f"{now.year}"
         q = f"{topics} {sources} {freshness_hint} {date_hint}".strip()
-        promo_domains = list(WEB_PROMO_DOMAINS) + list(SOURCE_BLOCK_DOMAINS)
+        promo_domains = list(WEB_PROMO_DOMAINS) + list(blocked_src)
         logger.debug(
             "Pick draft: Tavily exclude_domains (%s): %s",
             len(promo_domains),
@@ -1991,7 +1981,7 @@ def _pick_draft_item(
                 _host(url) or "?",
             )
             continue
-        if _is_blocked_source_domain(url):
+        if _is_blocked_source_domain(url, blocked_src):
             n_blocked_source += 1
             raw_h = _host(url)
             host = raw_h.split(":", 1)[0].lower()

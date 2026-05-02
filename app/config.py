@@ -1,7 +1,28 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
+
+# Домены, нежелательные для черновиков (web + Tavily exclude_domains), если BLOCKED_SEARCH_DOMAINS не задан.
+_DEFAULT_BLOCKED_SEARCH_DOMAINS: tuple[str, ...] = (
+    "tiktok.com",
+    "vm.tiktok.com",
+    "store.steampowered.com",
+    "epicgames.com",
+    "apps.apple.com",
+    "play.google.com",
+)
+
+
+def _parse_blocked_search_domains_env() -> list[str]:
+    """Список доменов из BLOCKED_SEARCH_DOMAINS; пустая строка = явно пустой список."""
+    raw = os.getenv("BLOCKED_SEARCH_DOMAINS")
+    if raw is None:
+        return list(_DEFAULT_BLOCKED_SEARCH_DOMAINS)
+    s = raw.strip()
+    if not s:
+        return []
+    return [p.strip().lower() for p in s.split(",") if p.strip()]
 
 
 def _parse_bool_env(name: str, default: bool) -> bool:
@@ -88,6 +109,10 @@ class Config:
     # Не предлагать снова source_url из опубликованных постов (по approved_at) и отклонённых (по created_at).
     content_editor_exclude_posted_days: int = 14
     content_editor_exclude_rejected_days: int = 7
+    # Блокировка доменов в редакторе (Pick draft) и в Tavily exclude_domains; переопределяется env.
+    blocked_search_domains: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_BLOCKED_SEARCH_DOMAINS)
+    )
 
 
 def load_config() -> Config:
@@ -133,6 +158,7 @@ def load_config() -> Config:
         tg_default_ch = "rian_ru,readovkanews,meduzalive,tass_agency,thebell_io"
     ex_posted = _parse_int_env("CONTENT_EDITOR_EXCLUDE_POSTED_DAYS", 14, 1, 365)
     ex_rejected = _parse_int_env("CONTENT_EDITOR_EXCLUDE_REJECTED_DAYS", 7, 1, 365)
+    blocked_domains = _parse_blocked_search_domains_env()
 
     return Config(
         telegram_token=telegram_token,
@@ -160,4 +186,5 @@ def load_config() -> Config:
         content_editor_tg_default_channels=tg_default_ch,
         content_editor_exclude_posted_days=ex_posted,
         content_editor_exclude_rejected_days=ex_rejected,
+        blocked_search_domains=blocked_domains,
     )
