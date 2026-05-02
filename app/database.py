@@ -166,7 +166,7 @@ def save_draft_feedback(
     """Сохраняет ответ пользователя на вопрос после решения по черновику. Возвращает id строки или None."""
     uid = _uid_str(user_id)
     act = (action or "").strip().lower()
-    if act not in ("approved", "rejected", "edited"):
+    if act not in ("approved", "rejected", "edited", "expired_content"):
         logger.warning("save_draft_feedback: неизвестный action=%r user_id=%s", action, uid)
         return None
     prev = (draft_preview or "")[:100]
@@ -185,6 +185,39 @@ def save_draft_feedback(
     except Exception as exc:
         logger.exception("save_draft_feedback: %s", exc)
         return None
+
+
+def get_recent_expired_urls(user_id: int | str, hours: int = 24) -> set[str]:
+    """
+    source_url черновиков, по которым за последние `hours` часов записан фидбек action=expired_content.
+    Используется, чтобы не предлагать тот же устаревший URL повторно в одной «сессии» подбора.
+    """
+    uid = _uid_str(user_id)
+    h = max(1, min(24 * 14, int(hours)))
+    mod = f"-{h} hours"
+    out: set[str] = set()
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT TRIM(dp.source_url) AS u
+                FROM draft_feedback df
+                INNER JOIN draft_posts dp ON dp.id = df.draft_id AND dp.user_id = df.user_id
+                WHERE df.user_id = ?
+                  AND LOWER(TRIM(df.action)) = 'expired_content'
+                  AND df.draft_id IS NOT NULL
+                  AND datetime(df.created_at) > datetime('now', ?)
+                  AND TRIM(COALESCE(dp.source_url, '')) != ''
+                """,
+                (uid, mod),
+            ).fetchall()
+        for r in rows:
+            u = str(r["u"] or "").strip()
+            if u:
+                out.add(u)
+    except Exception as exc:
+        logger.exception("get_recent_expired_urls: %s", exc)
+    return out
 
 
 def get_pending_feedbacks(user_id: int | str, since_last_count: int) -> list[dict[str, Any]]:

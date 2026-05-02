@@ -219,6 +219,8 @@ def _map_editor_action_to_feedback(action: str) -> str:
         return "отказ"
     if a == "edited":
         return "правка текста черновика"
+    if a == "expired_content":
+        return "материал устарел (не отказ по качеству источника)"
     return a or "решение по черновику"
 
 
@@ -2041,6 +2043,50 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
                 "Записал отказ в мою «чёрную маленькую тетрадь» подбора — в следующий раз уйду чуть в сторону 📝❌"
             )
             _schedule_ask_why(bot, callback.message.chat.id, user_id, did, "rejected", body)
+            return
+        if act == "x":
+            set_draft_status(user_id, did, "rejected")
+            await callback.message.answer(
+                "Понял, новость протухла — не будем позорить канал залежалым 🗓️❌\n"
+                "Запомнил что ищем только свежак."
+            )
+            _schedule_ask_why(
+                bot, callback.message.chat.id, user_id, did, "expired_content", body
+            )
+            pending_after = count_drafts(user_id, "draft")
+            logger.info(
+                "editor expired_content: user_id=%s draft_id=%s pending_after=%s",
+                user_id,
+                did,
+                pending_after,
+            )
+            if pending_after > 0:
+                next_row = get_oldest_draft(user_id, "draft")
+                if next_row:
+                    extra = (
+                        f"\n\nВ очереди после этого ещё {pending_after - 1} черновик(ов). "
+                        f"Хочешь добавить свежий в хвост — /drafts ещё (до {MAX_PENDING_UNAPPROVED_DRAFTS} шт.) 📎"
+                        if pending_after > 1
+                        else "\n\nЭто был предпоследний: после него останется пусто. "
+                        "Если захочешь ещё материал — /drafts ещё 🚀"
+                    )
+                    await callback.message.answer(
+                        draft_dm_text(next_row) + extra,
+                        reply_markup=build_editor_keyboard(int(next_row["id"])),
+                    )
+                return
+            prefs_after = memory.get_style_preferences(user_id)
+            if is_auto_enabled_pref(prefs_after):
+                await callback.message.answer(
+                    "Очередь теперь пустая, но я уже грею моторы 🤖⚡ "
+                    "Следующий черновик подъедет сам по авто-режиму. "
+                    "Не хочешь ждать — жми /drafts, принесу вручную."
+                )
+            else:
+                await callback.message.answer(
+                    "Очередь чистая как лист бумаги 🧼📝 "
+                    "Жми /drafts — и закину следующий материал на разбор."
+                )
             return
         if act == "e":
             set_pending_edit(user_id, did)

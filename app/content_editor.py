@@ -19,6 +19,7 @@ from app.database import (
     get_editorial_feedbacks_baseline,
     get_editorial_rules,
     get_feedbacks_count,
+    get_recent_expired_urls,
     save_editorial_rules,
 )
 from app.llm_agent import LLMAgent
@@ -198,6 +199,7 @@ _TG_DEFAULT_USERNAMES: list[str] = [
 CB_APPROVE = "a"
 CB_EDIT = "e"
 CB_REJECT = "r"
+CB_EXPIRED = "x"  # устарел контент — не blacklist / не штраф канала
 
 _pending_edit: dict[int, int] = {}
 _pending_feedback: dict[int, dict[str, Any]] = {}
@@ -1115,9 +1117,12 @@ def pop_pending_feedback(user_id: int) -> dict[str, Any] | None:
 EDITORIAL_DISTILL_EVERY = 5
 
 _EDITORIAL_DISTILL_SYSTEM = (
-    "Ты помогаешь редактору крипто-канала. По пакету его коротких комментариев к решениям по черновикам "
-    "нужно обновить список устойчивых редакторских предпочтений для будущих постов.\n"
-    "Формат: маркированный список на русском, без воды и повторов, конкретно про тон, угол, табу и акценты.\n"
+    "Ты помогаешь редактору крипто-канала. Во входе два блока фидбека: по устаревшим новостям "
+    "(источник ок, материал не свежий) и по отклонённым постам (нежелательно по сути). "
+    "Могут быть и прочие пояснения (апрув, правки).\n"
+    "Сформулируй правила отдельно для: (1) как определять устаревший контент; "
+    "(2) что делает пост нежелательным независимо от даты.\n"
+    "Формат: маркированный список на русском, без воды и повторов; можно два логических подпункта в списке.\n"
     "Если даны старые правила — объедини с новым смыслом, убери дубли и явные противоречия (новые факты из батча важнее).\n"
     "Не больше ~2000 символов. Только список, без вступлений и без подписи."
 )
@@ -1144,14 +1149,27 @@ def maybe_distill_editorial_rules_sync(agent: LLMAgent, user_id: int) -> None:
         )
         return
 
-    lines: list[str] = []
-    for i, r in enumerate(batch, start=1):
-        act = str(r.get("action") or "")
+    expired_lines: list[str] = []
+    rejected_lines: list[str] = []
+    other_lines: list[str] = []
+    for r in batch:
+        act = str(r.get("action") or "").strip().lower()
         prev = str(r.get("draft_preview") or "").replace("\n", " ").strip()
         fb = str(r.get("feedback_text") or "").replace("\n", " ").strip()
-        lines.append(
-            f"{i}. Действие: {act}. Фрагмент черновика: {prev[:180]}. Комментарий: {fb[:600]}"
+        line = (
+            f"Действие: {act}. Фрагмент черновика: {prev[:180]}. Комментарий: {fb[:600]}"
         )
+        if act == "expired_content":
+            expired_lines.append(line)
+        elif act == "rejected":
+            rejected_lines.append(line)
+        else:
+            other_lines.append(line)
+
+    def _numbered(block: list[str]) -> str:
+        if not block:
+            return "(нет)"
+        return "\n".join(f"{i}. {t}" for i, t in enumerate(block, start=1))
 
     prior = (get_editorial_rules(user_id) or "").strip()
     prior_block = prior if prior else "(пока нет — составь с нуля по этому батчу)"
@@ -1159,9 +1177,22 @@ def maybe_distill_editorial_rules_sync(agent: LLMAgent, user_id: int) -> None:
     user_payload = (
         "Текущие правила:\n"
         f"{prior_block}\n\n"
-        f"Новые {EDITORIAL_DISTILL_EVERY} пояснений редактора:\n"
-        + "\n".join(lines)
-        + "\n\nОбнови правила одним списком."
+        f"Новые {EDITORIAL_DISTILL_EVERY} пояснений редактора (разбивка по типу решения).\n\n"
+        "Фидбек по устаревшим новостям (action=expired_content):\n"
+        f"{_numbered(expired_lines)}\n\n"
+        "Фидбек по отклонённым постам (action=rejected):\n"
+        f"{_numbered(rejected_lines)}\n"
+    )
+    if other_lines:
+        user_payload += (
+            "\nПрочие пояснения (другие действия по черновикам):\n"
+            f"{_numbered(other_lines)}\n"
+        )
+    user_payload += (
+        "\nСформулируй правила отдельно для:\n"
+        "1. Как определять устаревший контент\n"
+        "2. Что делает пост нежелательным независимо от даты\n\n"
+        "Обнови итог одним связным списком (допустимы подзаголовки внутри списка)."
     )
 
     try:
@@ -1208,7 +1239,7 @@ def parse_editor_callback(data: str) -> tuple[str, int | None]:
     if len(parts) != 3 or parts[0] != "editor":
         return "", None
     act, sid = parts[1], parts[2]
-    if act not in (CB_APPROVE, CB_EDIT, CB_REJECT):
+    if act not in (CB_APPROVE, CB_EDIT, CB_REJECT, CB_EXPIRED):
         return "", None
     try:
         return act, int(sid)
@@ -1229,7 +1260,16 @@ def build_editor_keyboard(draft_id: int) -> InlineKeyboardMarkup:
                     callback_data=f"editor:{CB_EDIT}:{draft_id}",
                 ),
             ],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data=f"editor:{CB_REJECT}:{draft_id}")],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отменить",
+                    callback_data=f"editor:{CB_REJECT}:{draft_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🕐 Устарело",
+                    callback_data=f"editor:{CB_EXPIRED}:{draft_id}",
+                ),
+            ],
         ]
     )
 
@@ -2151,6 +2191,14 @@ def create_draft_from_search(
     merged_excl: set[str] = set(from_db)
     if excluded_urls:
         merged_excl |= excluded_urls
+    for u in get_recent_expired_urls(user_id, hours=24):
+        u = (u or "").strip()
+        if not u:
+            continue
+        merged_excl.add(u.lower())
+        norm = _norm_cmp_url(u)
+        if norm:
+            merged_excl.add(norm.lower())
     logger.info(
         "Draft creation: user_id=%s checking against %s excluded source URLs "
         "(DB posted≤%sd + rejected≤%sd + pending drafts; +caller_extra=%s)",
