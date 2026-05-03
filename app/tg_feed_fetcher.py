@@ -1,10 +1,12 @@
 """Публичные посты каналов через страницу t.me/s/username (без Bot API)."""
 from __future__ import annotations
 
+import errno
 import html as html_module
 import logging
 import random
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -15,7 +17,20 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
-FETCH_TIMEOUT_SEC = 18
+_FETCH_HTTP_SEC = 18
+FETCH_TIMEOUT_SEC = max(15, _FETCH_HTTP_SEC)
+
+_RETRY_AFTER_TIMEOUT_SEC = 2.0
+
+
+def _is_timeout_exc(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ETIMEDOUT:
+        return True
+    if isinstance(exc, urllib.error.URLError) and exc.reason is not None:
+        return _is_timeout_exc(exc.reason)
+    return False
 
 
 def _norm_username(raw: str) -> str:
@@ -39,11 +54,28 @@ def fetch_public_channel_posts(username: str, *, limit: int = 6) -> list[dict[st
         return []
     url = f"https://t.me/s/{un}"
     req = urllib.request.Request(url, headers={"User-Agent": UA}, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_SEC) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        logger.warning("tg_feed: не удалось загрузить %s: %s", url, exc)
+    body: str | None = None
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_SEC) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            break
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            is_to = _is_timeout_exc(exc)
+            if attempt == 1 and is_to:
+                time.sleep(_RETRY_AFTER_TIMEOUT_SEC)
+                continue
+            if is_to:
+                logger.warning(
+                    "tg_feed: не удалось загрузить %s (таймаут после повтора): %s",
+                    url,
+                    exc,
+                )
+            else:
+                logger.warning("tg_feed: не удалось загрузить %s: %s", url, exc)
+            return []
+
+    if body is None:
         return []
 
     chunks = body.split("tgme_widget_message_wrap")

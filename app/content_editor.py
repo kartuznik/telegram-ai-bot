@@ -1791,69 +1791,131 @@ def _pick_draft_item(
     candidates: list[dict[str, Any]] = []
 
     if mode in ("web", "both") and agent.tavily:
-        freshness_terms = _freshness_terms_for_query(topics, sources)
-        freshness_hint = " ".join(freshness_terms)
-        now = datetime.utcnow()
-        date_hint = f"{now.year}"
-        q = f"{topics} {sources} {freshness_hint} {date_hint}".strip()
         promo_domains = list(WEB_PROMO_DOMAINS) + list(blocked_src)
         logger.debug(
             "Pick draft: Tavily exclude_domains (%s): %s",
             len(promo_domains),
             ", ".join(promo_domains),
         )
-        tail = _reject_hints_for_tavily_query(rejects)
-        if tail:
-            q += ". Исключай или обходи материалы, связанные с: " + ", ".join(tail)
-        result = agent._tavily_search(
-            q[:400],
-            max_results=6,
-            days=2,
-            exclude_domains=promo_domains,
+        now = datetime.utcnow()
+        date_hint = f"{now.year}"
+        raw_topics_pref = (prefs.get(PREF_TOPICS) or "").strip()
+        topics_list = (
+            [t.strip() for t in raw_topics_pref.split(",") if t.strip()]
+            if raw_topics_pref
+            else []
         )
-        result_items = result.get("results") if isinstance(result, dict) else None
-        if isinstance(result_items, list) and len(result_items) == 0:
-            logger.debug(
-                "Pick draft: Tavily вернул 0 результатов с days=2, fallback на days=5, query=%r",
-                q[:220],
-            )
-            result = agent._tavily_search(
-                q[:400],
-                max_results=6,
-                days=5,
-                exclude_domains=promo_domains,
-            )
-        if result and isinstance(result.get("results"), list):
-            cutoff = datetime.now(timezone.utc) - timedelta(
+
+        seen_web_urls: set[str] = set()
+        _TAVILY_WEB_CAP = 15
+
+        def _web_candidate_count() -> int:
+            return sum(1 for c in candidates if not c.get("from_tg"))
+
+        def _append_tavily_items_to_candidates(res: dict | None) -> int:
+            """Добавляет результаты Tavily в candidates (дедуп по URL, лимит веб-кандидатов)."""
+            if not res or not isinstance(res.get("results"), list):
+                return 0
+            cutoff_inner = datetime.now(timezone.utc) - timedelta(
                 days=_TAVILY_MAX_CANDIDATE_AGE_DAYS
             )
-            for it in result["results"]:
+            n = 0
+            for it in res["results"]:
+                if _web_candidate_count() >= _TAVILY_WEB_CAP:
+                    break
                 if not isinstance(it, dict):
                     continue
                 pub_dt = _tavily_published_utc(it)
-                if pub_dt is not None and pub_dt < cutoff:
+                if pub_dt is not None and pub_dt < cutoff_inner:
                     logger.debug(
                         "skip tavily_old_news published=%s url=%s",
                         it.get("published_date") or it.get("published"),
                         (it.get("url") or "").strip(),
                     )
                     continue
+                url_raw = (it.get("url") or "").strip()
+                if not url_raw:
+                    continue
+                url_key = _norm_cmp_url(url_raw).lower()
+                if url_key in seen_web_urls:
+                    continue
+                seen_web_urls.add(url_key)
                 candidates.append(
                     {
                         "title": (it.get("title") or "Без заголовка").strip(),
-                        "url": (it.get("url") or "").strip(),
+                        "url": url_raw,
                         "snippet": _snippet_from_tavily_item(it)[:800],
                         "from_tg": False,
                         "tg_disp": "",
                         "source_channel_username": "",
                     }
                 )
-        else:
-            logger.warning(
-                "Pick draft: web пустой или нет results (mode=%s, has_result=%s)",
-                mode,
-                bool(result),
+                n += 1
+            return n
+
+        if not topics_list:
+            freshness_terms = _freshness_terms_for_query(topics, sources)
+            freshness_hint = " ".join(freshness_terms)
+            q = f"{topics} {sources} {freshness_hint} {date_hint}".strip()
+            tail = _reject_hints_for_tavily_query(rejects)
+            if tail:
+                q += ". Исключай или обходи материалы, связанные с: " + ", ".join(tail)
+            result = agent._tavily_search(
+                q[:400],
+                max_results=6,
+                days=2,
+                exclude_domains=promo_domains,
             )
+            result_items = result.get("results") if isinstance(result, dict) else None
+            if isinstance(result_items, list) and len(result_items) == 0:
+                logger.debug(
+                    "Pick draft: Tavily вернул 0 результатов с days=2, fallback на days=5, query=%r",
+                    q[:220],
+                )
+                result = agent._tavily_search(
+                    q[:400],
+                    max_results=6,
+                    days=5,
+                    exclude_domains=promo_domains,
+                )
+            if result and isinstance(result.get("results"), list):
+                _append_tavily_items_to_candidates(result)
+            else:
+                logger.warning(
+                    "Pick draft: web пустой или нет results (mode=%s, has_result=%s)",
+                    mode,
+                    bool(result),
+                )
+        else:
+            for topic in topics_list[:5]:
+                if _web_candidate_count() >= _TAVILY_WEB_CAP:
+                    break
+                q = f"новости {topic} {date_hint}".strip()
+                result = agent._tavily_search(
+                    q[:400],
+                    max_results=3,
+                    days=2,
+                    exclude_domains=promo_domains,
+                )
+                result_items = result.get("results") if isinstance(result, dict) else None
+                if isinstance(result_items, list) and len(result_items) == 0:
+                    logger.debug(
+                        "Pick draft: Tavily вернул 0 результатов с days=2, fallback на days=5, query=%r",
+                        q[:220],
+                    )
+                    result = agent._tavily_search(
+                        q[:400],
+                        max_results=3,
+                        days=5,
+                        exclude_domains=promo_domains,
+                    )
+                n_added = _append_tavily_items_to_candidates(result)
+                logger.info("Tavily multi-query: topic=%s results=%s", topic, n_added)
+            if _web_candidate_count() == 0:
+                logger.warning(
+                    "Pick draft: web пустой или нет results (mode=%s, multi-topic)",
+                    mode,
+                )
 
     if mode in ("tg", "both"):
         user_tg_raw = (prefs.get(PREF_TG_CHANNELS) or "").strip()
@@ -1882,7 +1944,13 @@ def _pick_draft_item(
                 tail,
             )
         # Порядок HTTP к каналам задаётся в fetch_many_channels (random.shuffle).
-        for p in fetch_many_channels(chans, per_channel=2):
+        tg_posts = fetch_many_channels(chans, per_channel=2)
+        logger.info(
+            "TG fetch result: total_posts=%s from %s channels",
+            len(tg_posts),
+            n_ch,
+        )
+        for p in tg_posts:
             candidates.append(
                 {
                     "title": (p.get("title") or "Пост из Telegram").strip(),
