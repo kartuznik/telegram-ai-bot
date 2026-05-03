@@ -53,6 +53,7 @@ from app.content_editor import (
     MAX_PENDING_UNAPPROVED_DRAFTS,
     build_editor_keyboard,
     bump_approve,
+    channel_publish_text_from_draft_body,
     count_drafts,
     create_draft_from_search,
     draft_dm_text,
@@ -1929,10 +1930,11 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             return
         ch_id = int(str(row["channel_id"]))
         body = str(row.get("content") or "")
+        pub_text = channel_publish_text_from_draft_body(body)
         try:
             await bot.send_message(
                 chat_id=ch_id,
-                text=body,
+                text=pub_text,
                 disable_web_page_preview=False,
             )
         except TelegramBadRequest as exc:
@@ -1976,10 +1978,11 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
                     reply_markup=_expired_approve_keyboard(did),
                 )
                 return
+            pub_text = channel_publish_text_from_draft_body(body)
             try:
                 await bot.send_message(
                     chat_id=ch_id,
-                    text=body,
+                    text=pub_text,
                     disable_web_page_preview=False,
                 )
             except TelegramBadRequest as exc:

@@ -1666,6 +1666,31 @@ def hint_for_reject_from_draft(row: dict[str, Any]) -> str:
     return (str(row.get("content") or ""))[:48].replace("\n", " ").strip()
 
 
+_EDITOR_SERVICE_LINES_EXACT = frozenset(
+    {
+        "⚡ Редактор: черновик требует проверки — возможно мало фактуры",
+        "✅ Источник проверен",
+        "⚠️ Источник не верифицирован",
+    }
+)
+
+
+def channel_publish_text_from_draft_body(body: str) -> str:
+    """Текст для публикации в канал: без служебных строк, которые показываются только в ЛС."""
+    lines_out: list[str] = []
+    for line in (body or "").splitlines():
+        stripped = line.strip()
+        if stripped in _EDITOR_SERVICE_LINES_EXACT:
+            continue
+        if stripped.startswith("🔗 Источник в базе:"):
+            continue
+        lines_out.append(line)
+    out = "\n".join(lines_out).strip()
+    if not out:
+        return (body or "").strip()
+    return out
+
+
 def draft_dm_text(row: dict[str, Any]) -> str:
     sid = row.get("source_url") or ""
     head = "✍️ Черновик для канала @kriptogeograph — глянь и реши судьбу поста:\n\n"
