@@ -2050,9 +2050,6 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
                 "Понял, новость протухла — не будем позорить канал залежалым 🗓️❌\n"
                 "Запомнил что ищем только свежак."
             )
-            _schedule_ask_why(
-                bot, callback.message.chat.id, user_id, did, "expired_content", body
-            )
             pending_after = count_drafts(user_id, "draft")
             logger.info(
                 "editor expired_content: user_id=%s draft_id=%s pending_after=%s",
