@@ -5,7 +5,6 @@ import re
 import time
 import mimetypes
 import os
-import re
 import tempfile
 from io import BytesIO
 
@@ -63,6 +62,7 @@ from app.content_editor import (
     build_voice_examples_overlay,
     format_auto_interval_label,
     format_editor_info_text,
+    format_topics_settings_message,
     get_draft,
     get_oldest_draft,
     get_pending_edit,
@@ -77,11 +77,13 @@ from app.content_editor import (
     is_editor_enabled,
     is_private_chat,
     maybe_distill_editorial_rules_sync,
+    merge_topics_into_pref,
     maybe_note_shorter_edit,
     migrate_strip_vesti_reject_hints,
     parse_auto_directive_from_rest,
     parse_deadline_directive_from_rest,
     parse_editor_callback,
+    remove_topics_from_pref,
     parse_editor_extra_directives,
     pop_pending_edit,
     pop_pending_feedback,
@@ -89,6 +91,8 @@ from app.content_editor import (
     set_draft_status,
     set_pending_edit,
     set_pending_feedback,
+    split_topic_command_tokens,
+    topics_list_from_pref,
     update_draft_content,
 )
 from app.content_editor_background import run_content_editor_autofetch_loop
@@ -571,6 +575,24 @@ async def _editor_require_private(message: Message) -> bool:
     return True
 
 
+async def _require_owner_private(message: Message) -> bool:
+    """Настройки поиска: только владелец (ADMIN_ID) в личке."""
+    if not await _editor_require_private(message) or not message.from_user:
+        return False
+    if not is_admin(message.from_user.id):
+        await message.answer(NO_ADMIN_RIGHTS)
+        return False
+    return True
+
+
+def _topics_command_tail(text: str) -> str:
+    t = (text or "").strip()
+    m = re.match(r"/topics(?:@\w+)?\s*(.*)$", t, re.IGNORECASE | re.DOTALL)
+    if m:
+        return (m.group(1) or "").strip()
+    return ""
+
+
 def _telegram_answer_chunks(text: str, limit: int = 3900) -> list[str]:
     """Дробит длинный текст для Telegram (лимит сообщения 4096)."""
     t = (text or "").strip()
@@ -964,6 +986,107 @@ async def editor_prefs_cmd(message: Message) -> None:
         await message.answer("Нечего менять — глянь /editor_prefs без хвоста для сводки 📋")
         return
     await message.answer("Записал: " + "; ".join(bits) + " — жми /drafts или жди авто 🚀")
+
+
+@router.message(Command("topics"))
+async def topics_cmd(message: Message) -> None:
+    """Темы поиска редактора: просмотр и правки только для ADMIN_ID."""
+    if not await _require_owner_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    tail = _topics_command_tail(message.text or "")
+    prefs = memory.get_style_preferences(uid)
+    old_val = prefs.get(PREF_TOPICS, "") or ""
+
+    if not tail:
+        await message.answer(format_topics_settings_message(old_val))
+        return
+
+    parts = tail.split(maxsplit=1)
+    sub = parts[0].lower()
+    body = (parts[1] if len(parts) > 1 else "").strip()
+
+    if sub == "clear":
+        new_val = ""
+        memory.update_style_preferences(uid, {PREF_TOPICS: new_val})
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            PREF_TOPICS,
+            old_val,
+            new_val,
+        )
+        await message.answer(
+            "✅ Темы очищены.\n\n" + format_topics_settings_message(new_val)
+        )
+        return
+
+    if sub == "add":
+        tokens = split_topic_command_tokens(body)
+        if not tokens:
+            await message.answer(
+                "❌ Укажи темы: например `/topics add игры, аниме`",
+            )
+            return
+        new_val, added = merge_topics_into_pref(old_val, tokens)
+        if not added:
+            await message.answer(
+                "ℹ️ Все указанные темы уже в списке.\n\n"
+                + format_topics_settings_message(old_val),
+            )
+            return
+        memory.update_style_preferences(uid, {PREF_TOPICS: new_val})
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            PREF_TOPICS,
+            old_val,
+            new_val,
+        )
+        n_total = len(topics_list_from_pref(new_val))
+        await message.answer(
+            f"✅ Добавлены темы: {', '.join(added)} (всего {n_total}).\n\n"
+            + format_topics_settings_message(new_val),
+        )
+        return
+
+    if sub == "remove":
+        tokens = split_topic_command_tokens(body)
+        if not tokens:
+            await message.answer(
+                "❌ Укажи тему: например `/topics remove юмор`",
+            )
+            return
+        new_val, removed = remove_topics_from_pref(old_val, tokens)
+        if not removed:
+            await message.answer(
+                "ℹ️ Таких тем в списке не было.\n\n"
+                + format_topics_settings_message(old_val),
+            )
+            return
+        memory.update_style_preferences(uid, {PREF_TOPICS: new_val})
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            PREF_TOPICS,
+            old_val,
+            new_val,
+        )
+        await message.answer(
+            "✅ Удалены темы: "
+            + ", ".join(removed)
+            + ".\n\n"
+            + format_topics_settings_message(new_val),
+        )
+        return
+
+    await message.answer(
+        "Не разобрал команду. Варианты:\n"
+        "• `/topics` — текущий список\n"
+        "• `/topics add тема1, тема2`\n"
+        "• `/topics remove тема`\n"
+        "• `/topics clear`",
+    )
 
 
 @router.message(Command("editor_reset_rejects"))

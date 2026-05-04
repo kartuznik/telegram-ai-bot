@@ -59,6 +59,7 @@ def build_admin_bot_commands() -> list[BotCommand]:
         BotCommand(command="ban", description="[Админ] Забанить user_id"),
         BotCommand(command="unban", description="[Админ] Разбанить user_id"),
         BotCommand(command="users", description="[Админ] Список пользователей"),
+        BotCommand(command="topics", description="[Админ] Темы поиска редактора"),
         *build_health_bot_commands(),
     ]
 

@@ -1425,6 +1425,73 @@ def _normalize_user_topics(raw_topics: str) -> list[str]:
     return out
 
 
+def topics_list_from_pref(pref_topics: str) -> list[str]:
+    """Упорядоченный список тем из значения PREF_TOPICS."""
+    return _normalize_user_topics(pref_topics)
+
+
+def topics_pref_from_list(topics: list[str]) -> str:
+    """Строка для SQLite user_preferences (обрезка как у прочих prefs)."""
+    s = ", ".join(topics)
+    return s[:800]
+
+
+def merge_topics_into_pref(old_pref: str, tokens: list[str]) -> tuple[str, list[str]]:
+    """Добавляет темы; возвращает (новое значение pref, список реально добавленных)."""
+    cur = _normalize_user_topics(old_pref)
+    added: list[str] = []
+    for t in tokens:
+        if not t:
+            continue
+        if t not in cur:
+            cur.append(t)
+            added.append(t)
+    return topics_pref_from_list(cur), added
+
+
+def remove_topics_from_pref(old_pref: str, tokens: list[str]) -> tuple[str, list[str]]:
+    """Удаляет темы по нормализованному совпадению."""
+    cur = _normalize_user_topics(old_pref)
+    remove_set = {t for t in _normalize_user_topics(", ".join(tokens)) if t}
+    if not remove_set:
+        return topics_pref_from_list(cur), []
+    removed: list[str] = []
+    new_list: list[str] = []
+    for t in cur:
+        if t in remove_set:
+            removed.append(t)
+        else:
+            new_list.append(t)
+    return topics_pref_from_list(new_list), removed
+
+
+def split_topic_command_tokens(blob: str) -> list[str]:
+    """Разбор хвоста после `add` / `remove`: запятые, пробелы, переводы строк."""
+    parts = re.split(r"[,\n;|/\s]+", (blob or "").strip())
+    out: list[str] = []
+    for p in parts:
+        topic = p.strip().lower().replace("ё", "е")
+        topic = re.sub(r"\s+", " ", topic)
+        if topic:
+            out.append(topic)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq
+
+
+def format_topics_settings_message(pref_topics: str | None) -> str:
+    """Текущее состояние тем для ответа пользователю после /topics."""
+    raw = (pref_topics or "").strip()
+    lst = topics_list_from_pref(raw)
+    if not lst:
+        return "⚙️ Темы поиска: пусто (при подборе может использоваться значение по умолчанию)."
+    return f"⚙️ Темы поиска ({len(lst)}): " + ", ".join(lst)
+
+
 def _score_matches_user_topics(
     score_map: dict[str, int], user_topics: list[str], post_text_low: str
 ) -> tuple[bool, str]:
