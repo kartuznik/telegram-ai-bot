@@ -115,6 +115,17 @@ WEB_PROMO_DOMAINS = (
     # Промо/агрегаторы: передаём в Tavily как exclude_domains (не в текст запроса).
     "ign.com",
 )
+LOW_QUALITY_WEB_DOMAINS = frozenset(
+    {
+        "t.me",
+        "telegram.me",
+        "telegra.ph",
+        "dzen.ru",
+        "zen.yandex.ru",
+        "pikabu.ru",
+    }
+)
+MIN_WEB_SNIPPET_LEN = 100
 TRUSTED_DOMAINS = frozenset(
     {
         "ria.ru",
@@ -886,6 +897,15 @@ def _assess_draft_quality(draft_text: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _append_weak_draft_marker(text: str) -> str:
+    """Финальная пометка для слабого черновика (после исчерпания ретраев или при выключенной опции)."""
+    warn_line = "⚠️ Требует проверки"
+    t = (text or "").strip()
+    if warn_line in t:
+        return t
+    return f"{t.rstrip()}\n\n{warn_line}".strip()
+
+
 def _get_related_context(user_id: int, title: str, limit: int = 20) -> str | None:
     words_new = _title_tokens_for_similarity(title)
     if not words_new:
@@ -1060,10 +1080,9 @@ def reject_spree_should_pause(user_id: int, prefs: dict[str, str]) -> bool:
     rc_fb, ac_fb = get_draft_feedback_rejected_approved_counts(user_id)
     rc_p = int(prefs.get(PREF_REJECT_COUNT, "0") or 0)
     ac_p = int(prefs.get(PREF_APPROVE_COUNT, "0") or 0)
-    if rc_fb > 0 or ac_fb > 0:
-        rc, ac = rc_fb, ac_fb
-    else:
-        rc, ac = rc_p, ac_p
+    # Исторически feedback-таблица может быть неполной после миграций.
+    # Берём максимум между feedback и prefs, чтобы не ловить ложную «серию отказов».
+    rc, ac = max(rc_fb, rc_p), max(ac_fb, ac_p)
     return rc >= 8 and rc >= ac + 6
 
 
@@ -1763,6 +1782,7 @@ def _snippet_from_tavily_item(it: dict[str, Any]) -> str:
 
 
 _TAVILY_MAX_CANDIDATE_AGE_DAYS = 30
+_MIN_WEB_EFFECTIVE_SCORE = 5.0
 
 
 def _tavily_published_utc(it: dict[str, Any]) -> datetime | None:
@@ -1782,6 +1802,16 @@ def _tavily_published_utc(it: dict[str, Any]) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _domain_matches(host: str, domains: frozenset[str]) -> bool:
+    h = (host or "").split(":", 1)[0].lower().lstrip("www.")
+    if not h:
+        return False
+    for d in domains:
+        if h == d or h.endswith(f".{d}"):
+            return True
+    return False
 
 
 def _freshness_terms_for_query(topics: str, sources: str) -> list[str]:
@@ -1861,15 +1891,31 @@ def _pick_draft_item(
                 url_raw = (it.get("url") or "").strip()
                 if not url_raw:
                     continue
+                host = _host(url_raw)
+                if _domain_matches(host, LOW_QUALITY_WEB_DOMAINS):
+                    logger.debug(
+                        "skip tavily_low_quality_domain host=%s url=%s",
+                        host or "?",
+                        url_raw[:220],
+                    )
+                    continue
                 url_key = _norm_cmp_url(url_raw).lower()
                 if url_key in seen_web_urls:
+                    continue
+                snippet = _snippet_from_tavily_item(it)[:800]
+                if len(snippet.strip()) < MIN_WEB_SNIPPET_LEN:
+                    logger.debug(
+                        "skip tavily_short_snippet len=%s url=%s",
+                        len(snippet.strip()),
+                        url_raw[:220],
+                    )
                     continue
                 seen_web_urls.add(url_key)
                 candidates.append(
                     {
                         "title": (it.get("title") or "Без заголовка").strip(),
                         "url": url_raw,
-                        "snippet": _snippet_from_tavily_item(it)[:800],
+                        "snippet": snippet,
                         "from_tg": False,
                         "tg_disp": "",
                         "source_channel_username": "",
@@ -2049,7 +2095,7 @@ def _pick_draft_item(
         )
     ranked.sort(key=lambda x: (x[0], x[1], x[2]))
 
-    n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = n_blocked_source = 0
+    n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = n_blocked_source = n_low_score = 0
     for (
         soft_pen,
         _score_sort,
@@ -2092,6 +2138,15 @@ def _pick_draft_item(
             if host.startswith("www."):
                 host = host[4:]
             logger.debug("skip blocked_source_domain domain=%s url=%s", host, url[:200])
+            continue
+        if (not c.get("from_tg")) and (float(sum(score_map.values()) if USE_PATTERNS else 0) * quality_mult * breaking_mult < _MIN_WEB_EFFECTIVE_SCORE):
+            n_low_score += 1
+            logger.debug(
+                "Pick draft: skip low_effective_score url=%r eff_score=%.2f threshold=%.2f",
+                url[:120],
+                float(sum(score_map.values()) if USE_PATTERNS else 0) * quality_mult * breaking_mult,
+                _MIN_WEB_EFFECTIVE_SCORE,
+            )
             continue
         title = (c.get("title") or "").strip() or "Без заголовка"
         content = (c.get("snippet") or "").strip()
@@ -2163,13 +2218,14 @@ def _pick_draft_item(
     else:
         logger.warning(
             "Pick draft: ни один кандидат не подошёл (mode=%s, n=%s excluded=%s hard_host=%s "
-            "url_reject=%s blocked_source=%s kw=%s no_url=%s)",
+            "url_reject=%s blocked_source=%s low_score=%s kw=%s no_url=%s)",
             mode,
             len(candidates),
             n_excluded,
             n_hard_host,
             n_url_rej,
             n_blocked_source,
+            n_low_score,
             n_kw,
             n_no_url,
         )
@@ -2186,7 +2242,7 @@ def draft_post_from_snippet(
     *,
     from_telegram: bool = False,
     telegram_channel_display: str = "",
-) -> str:
+) -> tuple[str, bool, str]:
     tg_overlay = ""
     if from_telegram:
         disp = telegram_channel_display.strip() or "@канал"
@@ -2234,12 +2290,9 @@ def draft_post_from_snippet(
             quality_reason,
             (url or "")[:300],
         )
-        warn_line = "⚡ Редактор: черновик требует проверки — возможно мало фактуры"
-        if warn_line not in text:
-            text = f"{text.rstrip()}\n\n{warn_line}".strip()
     if len(text) > MAX_POST_CHARS:
         text = text[: MAX_POST_CHARS - 1] + "…"
-    return text
+    return text, ok_quality, quality_reason
 
 
 def create_draft_from_search(
@@ -2305,28 +2358,68 @@ def create_draft_from_search(
     if merged_excl and logger.isEnabledFor(logging.DEBUG):
         sample = ", ".join(sorted(merged_excl)[:12])
         logger.debug("Draft creation excluded URLs sample: %s", sample[:500])
-    picked = _pick_draft_item(agent, prefs, user_id, merged_excl)
-    if not picked:
-        if mode == "tg":
-            return (
-                False,
-                "С публичных TG-каналов сейчас пусто — сеть, вёрстка t.me или смени список "
-                "«тгканалы:» в /editor_prefs. Веб не используется (источники:tg) 🛰️",
-                None,
-            )
-        return False, "Ничего подходящего не нашёл — расширь темы в /editor_prefs или попробуй позже 🔎", None
     topics = prefs.get(PREF_TOPICS) or "новости"
     deadline_h = draft_deadline_hours_from_prefs(prefs)
-    body = draft_post_from_snippet(
-        agent,
-        user_id,
-        picked.title,
-        picked.snippet,
-        picked.url,
-        topics,
-        from_telegram=picked.from_telegram,
-        telegram_channel_display=picked.telegram_display,
-    )
+    cfg = getattr(agent, "config", None)
+    auto_retry_weak = bool(getattr(cfg, "auto_retry_weak_drafts", False)) if cfg else False
+
+    picked: DraftPick | None = None
+    body = ""
+    ok_quality = True
+    quality_reason = "ok"
+    prev_weak_body: str | None = None
+    prev_weak_pick: DraftPick | None = None
+
+    for attempt in range(2):
+        picked = _pick_draft_item(agent, prefs, user_id, merged_excl)
+        if not picked:
+            if attempt == 1 and prev_weak_body is not None and prev_weak_pick is not None:
+                picked = prev_weak_pick
+                body = _append_weak_draft_marker(prev_weak_body)
+                ok_quality = False
+                quality_reason = "retry_no_pick"
+                break
+            if mode == "tg":
+                return (
+                    False,
+                    "С публичных TG-каналов сейчас пусто — сеть, вёрстка t.me или смени список "
+                    "«тгканалы:» в /editor_prefs. Веб не используется (источники:tg) 🛰️",
+                    None,
+                )
+            return False, "Ничего подходящего не нашёл — расширь темы в /editor_prefs или попробуй позже 🔎", None
+
+        body, ok_quality, quality_reason = draft_post_from_snippet(
+            agent,
+            user_id,
+            picked.title,
+            picked.snippet,
+            picked.url,
+            topics,
+            from_telegram=picked.from_telegram,
+            telegram_channel_display=picked.telegram_display,
+        )
+        if ok_quality:
+            break
+        if auto_retry_weak and attempt < 1:
+            logger.warning(
+                "weak draft: retry 1/2 reason=%s url=%s",
+                quality_reason,
+                (picked.url or "")[:300],
+            )
+            u = (picked.url or "").strip()
+            if u:
+                merged_excl.add(u.lower())
+                nu = _norm_cmp_url(u)
+                if nu:
+                    merged_excl.add(nu.lower())
+            prev_weak_body, prev_weak_pick = body, picked
+            continue
+        body = _append_weak_draft_marker(body)
+        break
+
+    if picked is None:
+        return False, "Ничего подходящего не нашёл — расширь темы в /editor_prefs или попробуй позже 🔎", None
+
     logger.info(
         "create_draft_from_search: черновик после GPT, len=%s, source_url=%r tg=%s",
         len(body),

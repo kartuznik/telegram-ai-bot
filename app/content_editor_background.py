@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 from aiogram import Bot
@@ -34,7 +35,19 @@ from app.memory import ChatMemory
 
 logger = logging.getLogger(__name__)
 
-TICK_SECONDS = 15 * 60
+def _tick_seconds_from_env(default: int = 15 * 60) -> int:
+    raw = (os.getenv("AUTO_SEARCH_INTERVAL") or "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        logger.warning("Auto-search: invalid AUTO_SEARCH_INTERVAL=%r, fallback=%ss", raw, default)
+        return default
+    return max(15, min(7200, v))
+
+
+TICK_SECONDS = _tick_seconds_from_env()
 LIMIT_NOTIFY_COOLDOWN_SEC = 12 * 3600
 REJECT_PAUSE_SEC = 48 * 3600
 
@@ -105,7 +118,13 @@ async def _process_user_autofetch(bot: Bot, agent: LLMAgent, memory: ChatMemory,
         prefs = memory.get_style_preferences(user_id)
 
     if is_auto_paused(prefs):
-        logger.debug("content_editor autofetch: user_id=%s на паузе", user_id)
+        until = auto_paused_until_ts(prefs)
+        left = max(0.0, float(until or 0.0) - time.time())
+        logger.info(
+            "content_editor autofetch: user_id=%s на паузе, осталось ~%.0fs",
+            user_id,
+            left,
+        )
         return
 
     if reject_spree_should_pause(user_id, prefs):
@@ -169,7 +188,7 @@ async def _process_user_autofetch(bot: Bot, agent: LLMAgent, memory: ChatMemory,
 
     wait = seconds_until_next_auto_fetch(prefs)
     if wait > 0:
-        logger.debug(
+        logger.info(
             "content_editor autofetch: user_id=%s следующий проход через ~%.0fs",
             user_id,
             wait,

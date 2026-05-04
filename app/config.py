@@ -113,6 +113,10 @@ class Config:
     blocked_search_domains: list[str] = field(
         default_factory=lambda: list(_DEFAULT_BLOCKED_SEARCH_DOMAINS)
     )
+    auto_retry_weak_drafts: bool = field(
+        default_factory=lambda: os.getenv("AUTO_RETRY_WEAK_DRAFTS", "false").lower()
+        == "true"
+    )
 
 
 def load_config() -> Config:
