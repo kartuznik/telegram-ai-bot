@@ -65,6 +65,7 @@ from app.content_editor import (
     build_voice_examples_overlay,
     format_auto_interval_label,
     format_editor_info_text,
+    format_search_settings_message,
     format_search_window_settings_message,
     format_sources_settings_message,
     format_topics_settings_message,
@@ -1275,6 +1276,16 @@ async def searchwindow_cmd(message: Message) -> None:
         f"✅ Записал окно поиска: {n} дн.\n\n"
         + format_search_window_settings_message(prefs2),
     )
+
+
+@router.message(Command("searchsettings"))
+async def searchsettings_cmd(message: Message) -> None:
+    """Сводка настроек поиска: только владелец в личке (без записи в prefs)."""
+    if not await _require_owner_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    prefs = memory.get_style_preferences(uid)
+    await message.answer(format_search_settings_message(prefs))
 
 
 @router.message(Command("editor_reset_rejects"))
