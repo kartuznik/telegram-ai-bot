@@ -62,6 +62,8 @@ def build_admin_bot_commands() -> list[BotCommand]:
         BotCommand(command="topics", description="[Админ] Темы поиска редактора"),
         BotCommand(command="sources", description="[Админ] Уточнение к поиску"),
         BotCommand(command="searchwindow", description="[Админ] Окно дней поиска (Tavily)"),
+        BotCommand(command="searchmode", description="[Админ] Режим источников web/tg/both"),
+        BotCommand(command="automode", description="[Админ] Интервал и вкл/выкл авто-поиска"),
         BotCommand(command="searchsettings", description="[Админ] Сводка настроек поиска"),
         *build_health_bot_commands(),
     ]
@@ -158,10 +160,12 @@ _HELP_MIDDLE = (
     "• /editor_prefs тгканалы:@a,@b или /editor_prefs тгканалы @a @b — только список TG-каналов (опечатка «тканалы:»)\n"
     "• /editor_prefs биткоин,defi — по-прежнему можно одной строкой без слова «темы»\n"
     "• /editor_prefs источники:both — web (Tavily), tg (t.me/s), both (по умолчанию both); для web нужен TAVILY_API_KEY\n"
+    "• /searchmode web|tg|both — то же про источники одной командой (без хвоста — текущий режим)\n"
     "• /editor_info — сводка настроек; /editor_rules — накопленные правила для генерации черновиков; "
     "/editor_reset_rejects — сброс отказов и жёстких банов по сайту или tg:каналу\n"
     "• /editor_prefs авто:0.5 — авто-поиск черновиков примерно раз в 30 минут (также можно авто:1, авто:24 и т.д. до 168); "
     "авто:off — только ручной /drafts\n"
+    "• /automode 0.5|1|2|off|on — интервал и вкл/выкл авто-поиска (без хвоста — текущие настройки)\n"
     "• /drafts — очередь черновиков: покажу самый старый на решение; пусто — подберу новый; "
     "/drafts ещё — добавить ещё один материал в очередь (лимит неапрувнутых в коде, сейчас 6) ✅✏️❌\n"
     "• /editor_stop — пауза редактора и авто-поиска; в канал уйдёт только то, что ты одобришь в ЛС\n"

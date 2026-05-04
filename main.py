@@ -46,6 +46,10 @@ from app.content_editor import (
     PREF_SOURCE_MODE,
     PREF_AUTO_DISABLED_REASON,
     PREF_AUTO_ENABLED,
+    PREF_AUTO_INTERVAL_HOURS,
+    MAX_AUTO_INTERVAL_HOURS,
+    MIN_AUTO_INTERVAL_HOURS,
+    _fmt_hours_value,
     auto_interval_hours_from_prefs,
     draft_deadline_hours_from_prefs,
     detect_primary_category,
@@ -614,6 +618,22 @@ def _sources_command_tail(text: str) -> str:
 def _searchwindow_command_tail(text: str) -> str:
     t = (text or "").strip()
     m = re.match(r"/searchwindow(?:@\w+)?\s*(.*)$", t, re.IGNORECASE | re.DOTALL)
+    if m:
+        return (m.group(1) or "").strip()
+    return ""
+
+
+def _searchmode_command_tail(text: str) -> str:
+    t = (text or "").strip()
+    m = re.match(r"/searchmode(?:@\w+)?\s*(.*)$", t, re.IGNORECASE | re.DOTALL)
+    if m:
+        return (m.group(1) or "").strip()
+    return ""
+
+
+def _automode_command_tail(text: str) -> str:
+    t = (text or "").strip()
+    m = re.match(r"/automode(?:@\w+)?\s*(.*)$", t, re.IGNORECASE | re.DOTALL)
     if m:
         return (m.group(1) or "").strip()
     return ""
@@ -1275,6 +1295,143 @@ async def searchwindow_cmd(message: Message) -> None:
     await message.answer(
         f"✅ Записал окно поиска: {n} дн.\n\n"
         + format_search_window_settings_message(prefs2),
+    )
+
+
+@router.message(Command("searchmode"))
+async def searchmode_cmd(message: Message) -> None:
+    """Режим источников подбора (web / tg / both): только владелец в личке."""
+    if not await _require_owner_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    tail = _searchmode_command_tail(message.text or "")
+    prefs = memory.get_style_preferences(uid)
+    old_mode = get_source_mode(prefs)
+
+    if not tail:
+        await message.answer(
+            "Режим источников: "
+            f"{old_mode} — "
+            "web (только веб), tg (только Telegram), both (веб и TG) 🌐"
+        )
+        return
+
+    mode = tail.strip().lower()
+    if mode not in ("web", "tg", "both"):
+        await message.answer(
+            "❌ Укажи режим: `/searchmode web`, `/searchmode tg` или `/searchmode both`.",
+        )
+        return
+
+    if mode == old_mode:
+        await message.answer(f"Режим источников уже {mode} — без изменений ✓")
+        return
+
+    memory.update_style_preferences(uid, {PREF_SOURCE_MODE: mode})
+    logger.info(
+        "search_setting_change user_id=%s key=%s old=%r new=%r",
+        uid,
+        "source_mode",
+        old_mode,
+        mode,
+    )
+    await message.answer(
+        f"✅ Режим источников: {mode} (было {old_mode}). "
+        "Сводка: /searchsettings или /editor_info 📋"
+    )
+
+
+@router.message(Command("automode"))
+async def automode_cmd(message: Message) -> None:
+    """Интервал и вкл/выкл авто-поиска черновиков: только владелец в личке."""
+    if not await _require_owner_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    tail = _automode_command_tail(message.text or "")
+    prefs = memory.get_style_preferences(uid)
+
+    if not tail:
+        ah = auto_interval_hours_from_prefs(prefs)
+        if is_auto_enabled_pref(prefs):
+            st = f"включён, интервал {format_auto_interval_label(ah)} ({_fmt_hours_value(ah)} ч)"
+        else:
+            st = f"выключен (последний интервал {format_auto_interval_label(ah)} — {_fmt_hours_value(ah)} ч)"
+        await message.answer(f"Авто-поиск: {st}")
+        return
+
+    low = tail.strip().lower()
+
+    if low in ("off", "выкл", "0"):
+        if not is_auto_enabled_pref(prefs):
+            await message.answer("Авто-поиск уже выключен ✓")
+            return
+        old_h = auto_interval_hours_from_prefs(prefs)
+        memory.update_style_preferences(uid, {PREF_AUTO_ENABLED: "0"})
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            "auto_interval",
+            _fmt_hours_value(old_h),
+            "off",
+        )
+        await message.answer("✅ Авто-поиск выключен (`/automode on` или число часов — снова включить)")
+        return
+
+    if low in ("on", "вкл"):
+        h = auto_interval_hours_from_prefs(prefs)
+        if is_auto_enabled_pref(prefs):
+            await message.answer(
+                f"Авто-поиск уже включён: {format_auto_interval_label(h)} ({_fmt_hours_value(h)} ч) ✓"
+            )
+            return
+        memory.update_style_preferences(
+            uid,
+            {
+                PREF_AUTO_ENABLED: "1",
+                PREF_AUTO_INTERVAL_HOURS: _fmt_hours_value(h),
+                PREF_AUTO_DISABLED_REASON: "",
+            },
+        )
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            "auto_interval",
+            "off",
+            _fmt_hours_value(h),
+        )
+        await message.answer(
+            f"✅ Авто-поиск включён: {format_auto_interval_label(h)} ({_fmt_hours_value(h)} ч)"
+        )
+        return
+
+    try:
+        new_h = float(tail.replace(",", ".").strip())
+    except ValueError:
+        await message.answer(
+            "❌ Не разобрал. Примеры: `/automode 0.5`, `/automode 1`, `/automode off`, `/automode on`."
+        )
+        return
+
+    new_h = max(MIN_AUTO_INTERVAL_HOURS, min(MAX_AUTO_INTERVAL_HOURS, new_h))
+    old_h = auto_interval_hours_from_prefs(prefs)
+    hs = _fmt_hours_value(new_h)
+    memory.update_style_preferences(
+        uid,
+        {
+            PREF_AUTO_ENABLED: "1",
+            PREF_AUTO_INTERVAL_HOURS: hs,
+            PREF_AUTO_DISABLED_REASON: "",
+        },
+    )
+    logger.info(
+        "search_setting_change user_id=%s key=%s old=%r new=%r",
+        uid,
+        "auto_interval",
+        _fmt_hours_value(old_h),
+        hs,
+    )
+    await message.answer(
+        f"✅ Авто-поиск включён: {format_auto_interval_label(new_h)} ({hs} ч)"
     )
 
 
