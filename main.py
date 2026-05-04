@@ -62,6 +62,7 @@ from app.content_editor import (
     build_voice_examples_overlay,
     format_auto_interval_label,
     format_editor_info_text,
+    format_sources_settings_message,
     format_topics_settings_message,
     get_draft,
     get_oldest_draft,
@@ -77,12 +78,14 @@ from app.content_editor import (
     is_editor_enabled,
     is_private_chat,
     maybe_distill_editorial_rules_sync,
+    merge_sources_into_pref,
     merge_topics_into_pref,
     maybe_note_shorter_edit,
     migrate_strip_vesti_reject_hints,
     parse_auto_directive_from_rest,
     parse_deadline_directive_from_rest,
     parse_editor_callback,
+    remove_sources_from_pref,
     remove_topics_from_pref,
     parse_editor_extra_directives,
     pop_pending_edit,
@@ -91,7 +94,9 @@ from app.content_editor import (
     set_draft_status,
     set_pending_edit,
     set_pending_feedback,
+    split_source_command_tokens,
     split_topic_command_tokens,
+    sources_list_from_pref,
     topics_list_from_pref,
     update_draft_content,
 )
@@ -593,6 +598,14 @@ def _topics_command_tail(text: str) -> str:
     return ""
 
 
+def _sources_command_tail(text: str) -> str:
+    t = (text or "").strip()
+    m = re.match(r"/sources(?:@\w+)?\s*(.*)$", t, re.IGNORECASE | re.DOTALL)
+    if m:
+        return (m.group(1) or "").strip()
+    return ""
+
+
 def _telegram_answer_chunks(text: str, limit: int = 3900) -> list[str]:
     """Дробит длинный текст для Telegram (лимит сообщения 4096)."""
     t = (text or "").strip()
@@ -1086,6 +1099,107 @@ async def topics_cmd(message: Message) -> None:
         "• `/topics add тема1, тема2`\n"
         "• `/topics remove тема`\n"
         "• `/topics clear`",
+    )
+
+
+@router.message(Command("sources"))
+async def sources_cmd(message: Message) -> None:
+    """Уточнение к поиску (PREF_SOURCES): только владелец в личке."""
+    if not await _require_owner_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    tail = _sources_command_tail(message.text or "")
+    prefs = memory.get_style_preferences(uid)
+    old_val = prefs.get(PREF_SOURCES, "") or ""
+
+    if not tail:
+        await message.answer(format_sources_settings_message(old_val))
+        return
+
+    parts = tail.split(maxsplit=1)
+    sub = parts[0].lower()
+    body = (parts[1] if len(parts) > 1 else "").strip()
+
+    if sub == "clear":
+        new_val = ""
+        memory.update_style_preferences(uid, {PREF_SOURCES: new_val})
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            PREF_SOURCES,
+            old_val,
+            new_val,
+        )
+        await message.answer(
+            "✅ Уточнение к поиску очищено.\n\n" + format_sources_settings_message(new_val)
+        )
+        return
+
+    if sub == "add":
+        tokens = split_source_command_tokens(body)
+        if not tokens:
+            await message.answer(
+                "❌ Укажи фрагменты: например `/sources add defi, мемы`",
+            )
+            return
+        new_val, added = merge_sources_into_pref(old_val, tokens)
+        if not added:
+            await message.answer(
+                "ℹ️ Все указанные фрагменты уже в списке.\n\n"
+                + format_sources_settings_message(old_val),
+            )
+            return
+        memory.update_style_preferences(uid, {PREF_SOURCES: new_val})
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            PREF_SOURCES,
+            old_val,
+            new_val,
+        )
+        n_total = len(sources_list_from_pref(new_val))
+        await message.answer(
+            f"✅ Добавлено к уточнению: {', '.join(added)} (всего {n_total}).\n\n"
+            + format_sources_settings_message(new_val),
+        )
+        return
+
+    if sub == "remove":
+        tokens = split_source_command_tokens(body)
+        if not tokens:
+            await message.answer(
+                "❌ Укажи фрагмент: например `/sources remove defi`",
+            )
+            return
+        new_val, removed = remove_sources_from_pref(old_val, tokens)
+        if not removed:
+            await message.answer(
+                "ℹ️ Таких фрагментов в списке не было.\n\n"
+                + format_sources_settings_message(old_val),
+            )
+            return
+        memory.update_style_preferences(uid, {PREF_SOURCES: new_val})
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            PREF_SOURCES,
+            old_val,
+            new_val,
+        )
+        await message.answer(
+            "✅ Удалены фрагменты: "
+            + ", ".join(removed)
+            + ".\n\n"
+            + format_sources_settings_message(new_val),
+        )
+        return
+
+    await message.answer(
+        "Не разобрал команду. Варианты:\n"
+        "• `/sources` — текущее уточнение\n"
+        "• `/sources add фраза1, фраза2`\n"
+        "• `/sources remove фраза`\n"
+        "• `/sources clear`",
     )
 
 

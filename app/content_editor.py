@@ -1492,6 +1492,32 @@ def format_topics_settings_message(pref_topics: str | None) -> str:
     return f"⚙️ Темы поиска ({len(lst)}): " + ", ".join(lst)
 
 
+def sources_list_from_pref(pref_sources: str) -> list[str]:
+    """Упорядоченный список фрагментов из значения PREF_SOURCES (как у тем)."""
+    return _normalize_user_topics(pref_sources)
+
+
+def merge_sources_into_pref(old_pref: str, tokens: list[str]) -> tuple[str, list[str]]:
+    return merge_topics_into_pref(old_pref, tokens)
+
+
+def remove_sources_from_pref(old_pref: str, tokens: list[str]) -> tuple[str, list[str]]:
+    return remove_topics_from_pref(old_pref, tokens)
+
+
+def split_source_command_tokens(blob: str) -> list[str]:
+    return split_topic_command_tokens(blob)
+
+
+def format_sources_settings_message(pref_sources: str | None) -> str:
+    """Текущее уточнение к поиску (PREF_SOURCES) для ответа после /sources."""
+    raw = (pref_sources or "").strip()
+    lst = sources_list_from_pref(raw)
+    if not lst:
+        return "⚙️ Уточнение к поиску: пусто (при подборе остаётся только строка тем)."
+    return f"⚙️ Уточнение к поиску ({len(lst)}): " + ", ".join(lst)
+
+
 def _score_matches_user_topics(
     score_map: dict[str, int], user_topics: list[str], post_text_low: str
 ) -> tuple[bool, str]:
