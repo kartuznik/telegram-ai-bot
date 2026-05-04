@@ -68,12 +68,16 @@ PREF_SOURCE_MODE = "content_editor_source_mode"
 PREF_TG_CHANNELS = "content_editor_tg_channels"
 PREF_HOST_REJECT_COUNTS = "content_editor_reject_host_counts"
 PREF_DRAFT_DEADLINE_HOURS = "content_editor_draft_deadline_hours"
+PREF_SEARCH_WINDOW_DAYS = "content_editor_search_window_days"
 
 DEFAULT_AUTO_INTERVAL_HOURS = 0.5
 MIN_AUTO_INTERVAL_HOURS = 0.5
 MAX_AUTO_INTERVAL_HOURS = 168
 DEFAULT_DRAFT_DEADLINE_HOURS = 24
 ALLOWED_DRAFT_DEADLINE_HOURS = frozenset({24, 48, 72})
+DEFAULT_SEARCH_WINDOW_DAYS = 2
+MIN_SEARCH_WINDOW_DAYS = 1
+MAX_SEARCH_WINDOW_DAYS = 30
 # Максимум черновиков в статусе draft на пользователя (ручной /drafts, авто-поиск, insert).
 MAX_PENDING_UNAPPROVED_DRAFTS = 6
 # Окна исключения source_url (подставляются из Config в init_content_editor_defaults).
@@ -1518,6 +1522,39 @@ def format_sources_settings_message(pref_sources: str | None) -> str:
     return f"⚙️ Уточнение к поиску ({len(lst)}): " + ", ".join(lst)
 
 
+def primary_search_window_days_from_prefs(prefs: dict[str, str]) -> int:
+    """Сколько дней «назад» передавать в Tavily на первой попытке (по умолчанию как в коде: 2)."""
+    raw = (prefs.get(PREF_SEARCH_WINDOW_DAYS) or "").strip()
+    if not raw:
+        return DEFAULT_SEARCH_WINDOW_DAYS
+    try:
+        n = int(raw)
+    except ValueError:
+        return DEFAULT_SEARCH_WINDOW_DAYS
+    return max(MIN_SEARCH_WINDOW_DAYS, min(n, MAX_SEARCH_WINDOW_DAYS))
+
+
+def tavily_fallback_days_after_empty(primary: int) -> int:
+    """Вторая попытка Tavily, если первая вернула 0 результатов (раньше: 2 → 5)."""
+    return min(max(primary, 5), MAX_SEARCH_WINDOW_DAYS)
+
+
+def format_search_window_settings_message(prefs: dict[str, str]) -> str:
+    """Текст сводки для /searchwindow (Tavily days + fallback)."""
+    raw = (prefs.get(PREF_SEARCH_WINDOW_DAYS) or "").strip()
+    p = primary_search_window_days_from_prefs(prefs)
+    fb = tavily_fallback_days_after_empty(p)
+    if not raw:
+        return (
+            f"⚙️ Окно поиска (Tavily): 1-я попытка — {p} дн., 2-я (если пусто) — {fb} дн. "
+            "— по умолчанию."
+        )
+    return (
+        f"⚙️ Окно поиска (Tavily): 1-я попытка — {p} дн., 2-я (если пусто) — {fb} дн. "
+        "— задано вручную."
+    )
+
+
 def _score_matches_user_topics(
     score_map: dict[str, int], user_topics: list[str], post_text_low: str
 ) -> tuple[bool, str]:
@@ -2127,6 +2164,8 @@ def _pick_draft_item(
             if raw_topics_pref
             else []
         )
+        primary_days = primary_search_window_days_from_prefs(prefs)
+        fallback_days = tavily_fallback_days_after_empty(primary_days)
 
         seen_web_urls: set[str] = set()
         _TAVILY_WEB_CAP = 15
@@ -2201,19 +2240,21 @@ def _pick_draft_item(
             result = agent._tavily_search(
                 q[:400],
                 max_results=6,
-                days=2,
+                days=primary_days,
                 exclude_domains=promo_domains,
             )
             result_items = result.get("results") if isinstance(result, dict) else None
             if isinstance(result_items, list) and len(result_items) == 0:
                 logger.debug(
-                    "Pick draft: Tavily вернул 0 результатов с days=2, fallback на days=5, query=%r",
+                    "Pick draft: Tavily вернул 0 результатов с days=%s, fallback на days=%s, query=%r",
+                    primary_days,
+                    fallback_days,
                     q[:220],
                 )
                 result = agent._tavily_search(
                     q[:400],
                     max_results=6,
-                    days=5,
+                    days=fallback_days,
                     exclude_domains=promo_domains,
                 )
             if result and isinstance(result.get("results"), list):
@@ -2232,19 +2273,21 @@ def _pick_draft_item(
                 result = agent._tavily_search(
                     q[:400],
                     max_results=3,
-                    days=2,
+                    days=primary_days,
                     exclude_domains=promo_domains,
                 )
                 result_items = result.get("results") if isinstance(result, dict) else None
                 if isinstance(result_items, list) and len(result_items) == 0:
                     logger.debug(
-                        "Pick draft: Tavily вернул 0 результатов с days=2, fallback на days=5, query=%r",
+                        "Pick draft: Tavily вернул 0 результатов с days=%s, fallback на days=%s, query=%r",
+                        primary_days,
+                        fallback_days,
                         q[:220],
                     )
                     result = agent._tavily_search(
                         q[:400],
                         max_results=3,
-                        days=5,
+                        days=fallback_days,
                         exclude_domains=promo_domains,
                     )
                 n_added = _append_tavily_items_to_candidates(result)

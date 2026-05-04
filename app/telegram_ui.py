@@ -61,6 +61,7 @@ def build_admin_bot_commands() -> list[BotCommand]:
         BotCommand(command="users", description="[Админ] Список пользователей"),
         BotCommand(command="topics", description="[Админ] Темы поиска редактора"),
         BotCommand(command="sources", description="[Админ] Уточнение к поиску"),
+        BotCommand(command="searchwindow", description="[Админ] Окно дней поиска (Tavily)"),
         *build_health_bot_commands(),
     ]
 

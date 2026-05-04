@@ -39,6 +39,7 @@ from app.content_editor import (
     PREF_CHANNEL,
     PREF_ENABLED,
     PREF_REJECT_COUNT,
+    PREF_SEARCH_WINDOW_DAYS,
     PREF_SOURCES,
     PREF_TG_CHANNELS,
     PREF_TOPICS,
@@ -52,6 +53,8 @@ from app.content_editor import (
     append_reject_hint,
     extract_tg_channel_username_from_url,
     MAX_PENDING_UNAPPROVED_DRAFTS,
+    MAX_SEARCH_WINDOW_DAYS,
+    MIN_SEARCH_WINDOW_DAYS,
     build_editor_keyboard,
     bump_approve,
     channel_publish_text_from_draft_body,
@@ -62,6 +65,7 @@ from app.content_editor import (
     build_voice_examples_overlay,
     format_auto_interval_label,
     format_editor_info_text,
+    format_search_window_settings_message,
     format_sources_settings_message,
     format_topics_settings_message,
     get_draft,
@@ -601,6 +605,14 @@ def _topics_command_tail(text: str) -> str:
 def _sources_command_tail(text: str) -> str:
     t = (text or "").strip()
     m = re.match(r"/sources(?:@\w+)?\s*(.*)$", t, re.IGNORECASE | re.DOTALL)
+    if m:
+        return (m.group(1) or "").strip()
+    return ""
+
+
+def _searchwindow_command_tail(text: str) -> str:
+    t = (text or "").strip()
+    m = re.match(r"/searchwindow(?:@\w+)?\s*(.*)$", t, re.IGNORECASE | re.DOTALL)
     if m:
         return (m.group(1) or "").strip()
     return ""
@@ -1200,6 +1212,68 @@ async def sources_cmd(message: Message) -> None:
         "• `/sources add фраза1, фраза2`\n"
         "• `/sources remove фраза`\n"
         "• `/sources clear`",
+    )
+
+
+@router.message(Command("searchwindow"))
+async def searchwindow_cmd(message: Message) -> None:
+    """Окно дней для Tavily (веб-подбор): только владелец в личке."""
+    if not await _require_owner_private(message) or not message.from_user:
+        return
+    uid = message.from_user.id
+    tail = _searchwindow_command_tail(message.text or "")
+    prefs = memory.get_style_preferences(uid)
+    old_val = prefs.get(PREF_SEARCH_WINDOW_DAYS, "") or ""
+
+    if not tail:
+        await message.answer(format_search_window_settings_message(prefs))
+        return
+
+    if tail.lower() == "clear":
+        new_val = ""
+        memory.update_style_preferences(uid, {PREF_SEARCH_WINDOW_DAYS: new_val})
+        logger.info(
+            "search_setting_change user_id=%s key=%s old=%r new=%r",
+            uid,
+            PREF_SEARCH_WINDOW_DAYS,
+            old_val,
+            new_val,
+        )
+        prefs2 = memory.get_style_preferences(uid)
+        await message.answer(
+            "✅ Окно поиска сброшено на значение по умолчанию.\n\n"
+            + format_search_window_settings_message(prefs2),
+        )
+        return
+
+    try:
+        n = int(tail.strip())
+    except ValueError:
+        await message.answer(
+            f"❌ Укажи целое число дней от {MIN_SEARCH_WINDOW_DAYS} до {MAX_SEARCH_WINDOW_DAYS}, "
+            "например `/searchwindow 7`, или `/searchwindow clear` для сброса.",
+        )
+        return
+
+    if n < MIN_SEARCH_WINDOW_DAYS or n > MAX_SEARCH_WINDOW_DAYS:
+        await message.answer(
+            f"❌ Допустимо {MIN_SEARCH_WINDOW_DAYS}–{MAX_SEARCH_WINDOW_DAYS} дней.",
+        )
+        return
+
+    new_val = str(n)
+    memory.update_style_preferences(uid, {PREF_SEARCH_WINDOW_DAYS: new_val})
+    logger.info(
+        "search_setting_change user_id=%s key=%s old=%r new=%r",
+        uid,
+        PREF_SEARCH_WINDOW_DAYS,
+        old_val,
+        new_val,
+    )
+    prefs2 = memory.get_style_preferences(uid)
+    await message.answer(
+        f"✅ Записал окно поиска: {n} дн.\n\n"
+        + format_search_window_settings_message(prefs2),
     )
 
 
