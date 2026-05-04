@@ -129,10 +129,20 @@ def init_db() -> None:
                     action TEXT NOT NULL,
                     draft_preview TEXT,
                     feedback_text TEXT,
+                    category TEXT,
+                    quality_score INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            fb_cols = {
+                str(r[1])
+                for r in conn.execute("PRAGMA table_info(draft_feedback)").fetchall()
+            }
+            if "category" not in fb_cols:
+                conn.execute("ALTER TABLE draft_feedback ADD COLUMN category TEXT")
+            if "quality_score" not in fb_cols:
+                conn.execute("ALTER TABLE draft_feedback ADD COLUMN quality_score INTEGER")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_draft_feedback_user_id "
                 "ON draft_feedback(user_id)"
@@ -162,6 +172,8 @@ def save_draft_feedback(
     action: str,
     draft_preview: str,
     feedback_text: str,
+    category: str | None = None,
+    quality_score: int | None = None,
 ) -> int | None:
     """Сохраняет ответ пользователя на вопрос после решения по черновику. Возвращает id строки или None."""
     uid = _uid_str(user_id)
@@ -171,14 +183,23 @@ def save_draft_feedback(
         return None
     prev = (draft_preview or "")[:100]
     text = feedback_text or ""
+    cat = (category or "").strip().lower()[:64] or None
+    q_score: int | None = None
+    if quality_score is not None:
+        try:
+            q_score = max(1, min(10, int(quality_score)))
+        except (TypeError, ValueError):
+            q_score = None
     try:
         with get_connection() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO draft_feedback (user_id, draft_id, action, draft_preview, feedback_text)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO draft_feedback (
+                    user_id, draft_id, action, draft_preview, feedback_text, category, quality_score
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (uid, draft_id, act, prev, text),
+                (uid, draft_id, act, prev, text, cat, q_score),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -368,4 +389,58 @@ def get_draft_feedback_slice(
         return [dict(r) for r in rows]
     except Exception as exc:
         logger.exception("get_draft_feedback_slice: %s", exc)
+        return []
+
+
+def get_feedback_category_counts_in_window(
+    user_id: int | str,
+    limit: int,
+) -> dict[str, int]:
+    """Сколько записей draft_feedback по каждой категории в последних `limit` строках (id DESC)."""
+    uid = _uid_str(user_id)
+    lim = max(1, min(int(limit), 200))
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT category
+                FROM draft_feedback
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (uid, lim),
+            ).fetchall()
+    except Exception as exc:
+        logger.exception("get_feedback_category_counts_in_window: %s", exc)
+        return {}
+    out: dict[str, int] = {}
+    for r in rows:
+        cat = (str(r["category"] or "").strip().lower() or "other")[:64]
+        out[cat] = out.get(cat, 0) + 1
+    return out
+
+
+def get_recent_draft_feedback_window(
+    user_id: int | str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Последние N записей draft_feedback (newest first) с category/quality_score."""
+    uid = _uid_str(user_id)
+    lim = max(1, min(int(limit), 200))
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, action, category, quality_score, created_at
+                FROM draft_feedback
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (uid, lim),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.exception("get_recent_draft_feedback_window: %s", exc)
         return []

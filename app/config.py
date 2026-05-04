@@ -117,6 +117,19 @@ class Config:
         default_factory=lambda: os.getenv("AUTO_RETRY_WEAK_DRAFTS", "false").lower()
         == "true"
     )
+    feedback_decay_rate: float = 0.88
+    feedback_window_size: int = 20
+    feedback_min_count_for_full_pref: int = 3
+    feedback_low_count_scale: float = 0.0
+    feedback_pref_max_gain: float = 0.10
+    feedback_pref_gain_per_unit: float = 0.15
+    feedback_novelty_bonus: float = 0.05
+    novelty_recent_drafts: int = 10
+    diversity_same_category_window: int = 3
+    diversity_narrow_mix_window: int = 5
+    diversity_narrow_mix_categories: int = 2
+    diversity_same_category_penalty: float = 0.30
+    diversity_other_categories_bonus: float = 0.20
 
 
 def load_config() -> Config:
@@ -163,6 +176,21 @@ def load_config() -> Config:
     ex_posted = _parse_int_env("CONTENT_EDITOR_EXCLUDE_POSTED_DAYS", 14, 1, 365)
     ex_rejected = _parse_int_env("CONTENT_EDITOR_EXCLUDE_REJECTED_DAYS", 7, 1, 365)
     blocked_domains = _parse_blocked_search_domains_env()
+    feedback_decay_rate = _parse_float_env("FEEDBACK_DECAY_RATE", 0.88, 0.5, 0.999)
+    feedback_window_size = _parse_int_env("FEEDBACK_WINDOW_SIZE", 20, 5, 100)
+    feedback_min_pref = _parse_int_env("FEEDBACK_MIN_COUNT_FOR_FULL_PREF", 3, 1, 50)
+    feedback_low_scale = _parse_float_env("FEEDBACK_LOW_COUNT_SCALE", 0.0, 0.0, 1.0)
+    feedback_pref_max_gain = _parse_float_env("FEEDBACK_PREF_MAX_GAIN", 0.10, 0.0, 0.5)
+    feedback_pref_gain_per_unit = _parse_float_env(
+        "FEEDBACK_PREF_GAIN_PER_UNIT", 0.15, 0.0, 1.0
+    )
+    feedback_novelty_bonus = _parse_float_env("FEEDBACK_NOVELTY_BONUS", 0.05, 0.0, 0.5)
+    novelty_recent_drafts = _parse_int_env("NOVELTY_RECENT_DRAFTS", 10, 1, 50)
+    div_same_window = _parse_int_env("DIVERSITY_SAME_CATEGORY_WINDOW", 3, 2, 10)
+    div_mix_window = _parse_int_env("DIVERSITY_NARROW_MIX_WINDOW", 5, 3, 15)
+    div_mix_cats = _parse_int_env("DIVERSITY_NARROW_MIX_CATEGORIES", 2, 1, 5)
+    div_same_penalty = _parse_float_env("DIVERSITY_SAME_CATEGORY_PENALTY", 0.30, 0.0, 0.9)
+    div_other_bonus = _parse_float_env("DIVERSITY_OTHER_CATEGORIES_BONUS", 0.20, 0.0, 1.0)
 
     return Config(
         telegram_token=telegram_token,
@@ -191,4 +219,17 @@ def load_config() -> Config:
         content_editor_exclude_posted_days=ex_posted,
         content_editor_exclude_rejected_days=ex_rejected,
         blocked_search_domains=blocked_domains,
+        feedback_decay_rate=feedback_decay_rate,
+        feedback_window_size=feedback_window_size,
+        feedback_min_count_for_full_pref=feedback_min_pref,
+        feedback_low_count_scale=feedback_low_scale,
+        feedback_pref_max_gain=feedback_pref_max_gain,
+        feedback_pref_gain_per_unit=feedback_pref_gain_per_unit,
+        feedback_novelty_bonus=feedback_novelty_bonus,
+        novelty_recent_drafts=novelty_recent_drafts,
+        diversity_same_category_window=div_same_window,
+        diversity_narrow_mix_window=div_mix_window,
+        diversity_narrow_mix_categories=div_mix_cats,
+        diversity_same_category_penalty=div_same_penalty,
+        diversity_other_categories_bonus=div_other_bonus,
     )

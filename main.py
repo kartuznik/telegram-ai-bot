@@ -48,6 +48,8 @@ from app.content_editor import (
     PREF_AUTO_ENABLED,
     auto_interval_hours_from_prefs,
     draft_deadline_hours_from_prefs,
+    detect_primary_category,
+    estimate_feedback_quality_score,
     append_reject_hint,
     extract_tg_channel_username_from_url,
     MAX_PENDING_UNAPPROVED_DRAFTS,
@@ -274,7 +276,17 @@ async def _ask_why_after_action(
     except TelegramBadRequest as exc:
         logger.warning("feedback_why: send failed user_id=%s: %s", user_id, exc)
         return
-    set_pending_feedback(user_id, draft_id, action, draft_body)
+    draft_title = (draft_body.splitlines()[0] if draft_body else "").strip()
+    category = detect_primary_category(draft_title, draft_body)
+    q_score = estimate_feedback_quality_score(action)
+    set_pending_feedback(
+        user_id,
+        draft_id,
+        action,
+        draft_body,
+        category=category,
+        quality_score=q_score,
+    )
 
 
 def _schedule_ask_why(
@@ -1320,6 +1332,10 @@ async def text_handler(message: Message, bot: Bot) -> None:
                 str(pf.get("action") or ""),
                 str(pf.get("draft_preview") or ""),
                 text.strip(),
+                category=str(pf.get("category") or ""),
+                quality_score=(
+                    int(pf["quality_score"]) if pf.get("quality_score") is not None else None
+                ),
             )
             pop_pending_feedback(uid)
             if rid is not None:

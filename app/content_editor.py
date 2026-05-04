@@ -20,6 +20,8 @@ from app.database import (
     get_editorial_feedbacks_baseline,
     get_editorial_rules,
     get_feedbacks_count,
+    get_feedback_category_counts_in_window,
+    get_recent_draft_feedback_window,
     get_recent_expired_urls,
     save_editorial_rules,
 )
@@ -214,6 +216,7 @@ DRAFT_SYSTEM = (
     "вроде «лучший», «невероятный», «потрясающий».\n"
     "Разрешено: лёгкий юмор и живой язык, но основа текста — новостная фактура.\n"
     "Если источник написан рекламно, перепиши факты своими словами и не копируй его тон.\n"
+    "Избегай копирования структуры предыдущих постов. Каждый пост должен иметь уникальную подачу, даже если тема похожа.\n"
     "Напиши ОДИН готовый пост: цепляющий заголовок в первой строке, пустая строка, "
     "2–3 предложения саммари с лёгким юмором и 2–3 разных эмодзи, пустая строка, "
     "строка «Источник:» и URL из входных данных.\n"
@@ -1116,12 +1119,20 @@ def set_pending_feedback(
     draft_id: int | None,
     action: str,
     draft_preview: str,
+    category: str | None = None,
+    quality_score: int | None = None,
 ) -> None:
     """Ожидание свободного ответа пользователя на вопрос после ✅/❌/✏️."""
     _pending_feedback[user_id] = {
         "draft_id": draft_id,
         "action": (action or "").strip().lower(),
         "draft_preview": (draft_preview or "")[:100],
+        "category": (category or "").strip().lower()[:64],
+        "quality_score": (
+            max(1, min(10, int(quality_score)))
+            if quality_score is not None
+            else None
+        ),
     }
 
 
@@ -1435,6 +1446,117 @@ def _score_matches_user_topics(
         if ut and ut in post_text_low:
             return True, f"user_topic_in_post_text:{ut}"
     return False, "score_no_topic_match"
+
+
+def detect_primary_category(title: str, snippet: str) -> str:
+    """Определяет ведущую категорию для материала (или 'other')."""
+    text = f"{title} {snippet}".strip()
+    if not text or not USE_PATTERNS:
+        return "other"
+    try:
+        score_map = score_text(text)
+    except Exception:
+        return "other"
+    if not score_map:
+        return "other"
+    return next(iter(score_map.keys()), "other") or "other"
+
+
+def estimate_feedback_quality_score(action: str) -> int:
+    """Оценка качества 1..10 для fallback, если пользователь не дал числовой рейтинг."""
+    act = (action or "").strip().lower()
+    if act == "approved":
+        return 8
+    if act == "edited":
+        return 6
+    if act == "rejected":
+        return 3
+    if act == "expired_content":
+        return 2
+    return 5
+
+
+def _feedback_signal_from_row(action: str, quality_score: int | None) -> float:
+    """Перевод feedback в сигнал -1..1 для preference."""
+    base = {
+        # Один апрув не должен доминировать: слабее базовый сигнал, чем раньше (1.0).
+        "approved": 0.4,
+        "edited": 0.35,
+        "rejected": -1.0,
+        "expired_content": -0.6,
+    }.get((action or "").strip().lower(), 0.0)
+    if quality_score is None:
+        return base
+    q = max(1, min(10, int(quality_score)))
+    q_centered = (q - 5.5) / 4.5  # 1->-1, 10->1
+    return max(-1.0, min(1.0, 0.7 * base + 0.3 * q_centered))
+
+
+def category_preferences_for_user(
+    user_id: int,
+    *,
+    window_size: int = 20,
+    decay_rate: float = 0.95,
+) -> dict[str, float]:
+    """
+    Скользящее окно с затуханием:
+    preference[category] = sum(signal_i * decay^i) / sum(decay^i),
+    где i=0 — самый свежий feedback.
+    """
+    rows = get_recent_draft_feedback_window(user_id, limit=window_size)
+    if not rows:
+        return {}
+    decay = max(0.5, min(0.999, float(decay_rate)))
+    num: dict[str, float] = {}
+    den: dict[str, float] = {}
+    for i, r in enumerate(rows):
+        category = (str(r.get("category") or "").strip().lower() or "other")[:64]
+        weight = decay**i
+        signal = _feedback_signal_from_row(
+            str(r.get("action") or ""),
+            int(r["quality_score"]) if r.get("quality_score") is not None else None,
+        )
+        num[category] = num.get(category, 0.0) + signal * weight
+        den[category] = den.get(category, 0.0) + weight
+    out: dict[str, float] = {}
+    for cat, d in den.items():
+        if d > 0:
+            out[cat] = num.get(cat, 0.0) / d
+    return out
+
+
+def recent_draft_categories(
+    user_id: int,
+    *,
+    limit: int = 5,
+) -> list[str]:
+    """Категории последних черновиков (draft/posted/rejected) для diversity-механики."""
+    uid = str(user_id)
+    lim = max(1, min(30, int(limit)))
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT content
+                FROM draft_posts
+                WHERE user_id=?
+                  AND status IN ('draft', 'posted', 'rejected')
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (uid, lim),
+            ).fetchall()
+    except Exception as exc:
+        logger.exception("recent_draft_categories: %s", exc)
+        return []
+    out: list[str] = []
+    for r in rows:
+        txt = str(r["content"] or "").strip()
+        if not txt:
+            continue
+        title = txt.splitlines()[0].strip() if txt.splitlines() else txt[:120]
+        out.append(detect_primary_category(title, txt[:400]))
+    return out
 
 
 def reset_editor_reject_state(memory: ChatMemory, user_id: int) -> tuple[int, int]:
@@ -1842,6 +1964,58 @@ def _pick_draft_item(
     reject_urls, hard_hosts, soft_hosts, kw_strings = _build_reject_filters(rejects, prefs)
     channel_quality = get_channel_quality_snapshot()
     blocked_src = frozenset(agent.config.blocked_search_domains)
+    cfg = getattr(agent, "config", None)
+    feedback_window = int(getattr(cfg, "feedback_window_size", 20) or 20)
+    decay_rate = float(getattr(cfg, "feedback_decay_rate", 0.95) or 0.95)
+    same_cat_window = int(getattr(cfg, "diversity_same_category_window", 3) or 3)
+    narrow_mix_window = int(getattr(cfg, "diversity_narrow_mix_window", 5) or 5)
+    narrow_mix_categories = int(getattr(cfg, "diversity_narrow_mix_categories", 2) or 2)
+    same_cat_penalty = float(getattr(cfg, "diversity_same_category_penalty", 0.30) or 0.30)
+    other_cat_bonus = float(getattr(cfg, "diversity_other_categories_bonus", 0.20) or 0.20)
+    cat_preferences = category_preferences_for_user(
+        user_id,
+        window_size=feedback_window,
+        decay_rate=decay_rate,
+    )
+    feedback_cat_counts = get_feedback_category_counts_in_window(user_id, feedback_window)
+    min_pref = int(getattr(cfg, "feedback_min_count_for_full_pref", 3) or 3)
+    max_pref_gain = float(getattr(cfg, "feedback_pref_max_gain", 0.10) or 0.10)
+    pref_gain_per_unit = float(getattr(cfg, "feedback_pref_gain_per_unit", 0.15) or 0.15)
+    novelty_bonus = float(getattr(cfg, "feedback_novelty_bonus", 0.05) or 0.05)
+    novelty_recent_n = int(getattr(cfg, "novelty_recent_drafts", 10) or 10)
+    novelty_cat_set = set(
+        recent_draft_categories(user_id, limit=max(1, novelty_recent_n))
+    )
+    recent_cats_same = recent_draft_categories(user_id, limit=same_cat_window)
+    recent_cats_mix = recent_draft_categories(user_id, limit=narrow_mix_window)
+    same_streak_cat = (
+        recent_cats_same[0]
+        if len(recent_cats_same) == same_cat_window
+        and len(set(recent_cats_same)) == 1
+        else ""
+    )
+    narrow_mix_active = (
+        len(recent_cats_mix) >= narrow_mix_window
+        and len(set(recent_cats_mix)) <= max(1, narrow_mix_categories)
+    )
+    if cat_preferences:
+        prefs_log = ", ".join(
+            f"preference[{k}]={v:.2f}" for k, v in sorted(cat_preferences.items())
+        )
+    else:
+        prefs_log = "preference[other]=0.00"
+    logger.info(
+        "Pick draft prefs: user_id=%s %s feedback_counts=%s min_pref=%s "
+        "diversity_same_streak=%r diversity_narrow_mix=%s recent_mix=%s novelty_recent_cats=%s",
+        user_id,
+        prefs_log,
+        feedback_cat_counts,
+        min_pref,
+        same_streak_cat or "",
+        narrow_mix_active,
+        recent_cats_mix[:narrow_mix_window],
+        sorted(novelty_cat_set),
+    )
 
     candidates: list[dict[str, Any]] = []
 
@@ -2042,7 +2216,24 @@ def _pick_draft_item(
         return None
 
     ranked: list[
-        tuple[int, float, int, dict[str, Any], str, dict[str, int], dict[str, list[str]], float, float]
+        tuple[
+            int,
+            float,
+            int,
+            dict[str, Any],
+            str,
+            dict[str, int],
+            dict[str, list[str]],
+            float,
+            float,
+            str,
+            float,
+            float,
+            float,
+            float,
+            float,
+            int,
+        ]
     ] = []
     for i, c in enumerate(candidates):
         url = (c.get("url") or "").strip()
@@ -2079,7 +2270,30 @@ def _pick_draft_item(
         if BREAKING_PATTERN.search(post_text):
             breaking_mult = 3.0
             logger.debug("breaking news boost url=%r", (c.get("url") or "")[:140])
-        effective_score = float(total_score) * quality_mult * breaking_mult
+        category = detect_primary_category(title, content)
+        pref_raw = cat_preferences.get(category, 0.0)
+        n_fb = int(feedback_cat_counts.get(category, 0))
+        if n_fb < min_pref:
+            pref_gain = 0.0
+            pref_mult = 1.0
+        else:
+            raw_delta = pref_gain_per_unit * pref_raw
+            pref_gain = max(-max_pref_gain, min(max_pref_gain, raw_delta))
+            pref_mult = 1.0 + pref_gain
+        diversity_mult = 1.0
+        if same_streak_cat and category == same_streak_cat:
+            diversity_mult *= 1.0 - max(0.0, min(0.9, same_cat_penalty))
+        elif narrow_mix_active and category not in set(recent_cats_mix):
+            diversity_mult *= 1.0 + max(0.0, min(1.0, other_cat_bonus))
+        novelty_mult = (1.0 + novelty_bonus) if category not in novelty_cat_set else 1.0
+        effective_score = (
+            float(total_score)
+            * quality_mult
+            * breaking_mult
+            * pref_mult
+            * diversity_mult
+            * novelty_mult
+        )
         ranked.append(
             (
                 soft_pen,
@@ -2091,6 +2305,13 @@ def _pick_draft_item(
                 cat_matches,
                 quality_mult,
                 breaking_mult,
+                category,
+                pref_raw,
+                pref_mult,
+                diversity_mult,
+                pref_gain,
+                novelty_mult,
+                n_fb,
             )
         )
     ranked.sort(key=lambda x: (x[0], x[1], x[2]))
@@ -2106,6 +2327,13 @@ def _pick_draft_item(
         cat_matches,
         quality_mult,
         breaking_mult,
+        category,
+        pref_raw,
+        pref_mult,
+        diversity_mult,
+        pref_gain,
+        novelty_mult,
+        n_fb,
     ) in ranked:
         url = (c.get("url") or "").strip()
         if not url:
@@ -2184,13 +2412,27 @@ def _pick_draft_item(
                 n_kw += 1
                 logger.debug("Pick draft: skip keyword %r", matched_bad)
                 continue
+        final_mult = pref_mult * diversity_mult * novelty_mult
         logger.info(
-            "Pick draft: выбран url=%r reject_key=%s netloc=%s tg=%s soft_penalty=%s total_score=%s quality_mult=%.3f breaking_mult=%.1f",
+            "Pick draft: выбран url=%r reject_key=%s netloc=%s tg=%s soft_penalty=%s "
+            "category=%s feedback_n=%s preference[%s]=%.3f pref_gain=%.3f pref_mult=%.3f "
+            "novelty_mult=%.3f diversity_mult=%.3f diversity_penalty=%.3f final_mult=%.3f "
+            "total_score=%s quality_mult=%.3f breaking_mult=%.1f",
             url[:120],
             rj_key or "?",
             _host(url) or "?",
             c.get("from_tg"),
             soft_pen,
+            category,
+            n_fb,
+            category,
+            pref_raw,
+            pref_gain,
+            pref_mult,
+            novelty_mult,
+            diversity_mult,
+            (1.0 - diversity_mult) if diversity_mult < 1.0 else 0.0,
+            final_mult,
             sum(score_map.values()) if USE_PATTERNS else 0,
             quality_mult,
             breaking_mult,
