@@ -64,7 +64,6 @@ def build_admin_bot_commands() -> list[BotCommand]:
         BotCommand(command="searchwindow", description="[Админ] Окно дней поиска (Tavily)"),
         BotCommand(command="searchmode", description="[Админ] Режим источников web/tg/both"),
         BotCommand(command="automode", description="[Админ] Интервал и вкл/выкл авто-поиска"),
-        BotCommand(command="searchsettings", description="[Админ] Сводка настроек поиска"),
         *build_health_bot_commands(),
     ]
 

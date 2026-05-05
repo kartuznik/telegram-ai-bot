@@ -679,6 +679,7 @@ def build_editorial_rules_overlay(user_id: int) -> str:
 def format_editor_info_text(prefs: dict[str, str], *, user_id: int | None = None) -> str:
     """Текст для /editor_info — сводка prefs редактора."""
     sm = get_source_mode(prefs)
+    search_window_line = format_search_window_settings_message(prefs)
     tg_raw = (prefs.get(PREF_TG_CHANNELS) or "").strip()
     tg_parsed = _parse_username_csv(tg_raw)
     if tg_parsed:
@@ -723,10 +724,12 @@ def format_editor_info_text(prefs: dict[str, str], *, user_id: int | None = None
         )
     return (
         "Текущие настройки редактора:\n\n"
-        f"• Источники: {sm} (web / tg / both)\n"
-        f"• ТГ-каналы: {tg_line}\n"
+        "Настройки поиска для подбора черновиков:\n"
+        f"• Темы поиска: {topics[:500]}{'…' if len(topics) > 500 else ''}\n"
+        f"• Режим источников: {sm} (web / tg / both)\n"
+        f"• {search_window_line}\n"
+        f"• TG-каналы: {tg_line}\n"
         f"  ({tg_note})\n\n"
-        f"• Темы: {topics[:500]}{'…' if len(topics) > 500 else ''}\n"
         f"• Уточнение к поиску: {sources[:500]}{'…' if len(sources) > 500 else ''}\n\n"
         f"• Срок жизни черновика: {deadline_h} ч\n"
         + voice_line
