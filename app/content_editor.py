@@ -23,6 +23,7 @@ from app.database import (
     get_feedback_category_counts_in_window,
     get_recent_draft_feedback_window,
     get_recent_expired_urls,
+    get_voice_training_examples,
     save_editorial_rules,
 )
 from app.llm_agent import LLMAgent
@@ -111,6 +112,7 @@ SOURCE_MODES = frozenset({"web", "tg", "both"})
 HOST_HARD_REJECT_THRESHOLD = 4
 URL_REJECT_PREFIX = "url:"
 VESTI_CLEANUP_USER_ID = 504425191
+LEARNING_OWNER_ID = 504425191
 VESTI_HOST_KEYS = frozenset({"vesti.ru", "www.vesti.ru"})
 WEB_PROMO_DOMAINS = (
     "goha.ru",
@@ -210,6 +212,7 @@ CB_EXPIRED = "x"  # устарел контент — не blacklist / не шт
 
 _pending_edit: dict[int, int] = {}
 _pending_feedback: dict[int, dict[str, Any]] = {}
+_pending_learning: dict[int, str] = {}
 
 DRAFT_SYSTEM = (
     "Ты — Кузьма, редактор коротких постов для Telegram-канала @kriptogeograph. "
@@ -618,10 +621,13 @@ def _approved_posts_count(user_id: int) -> int:
 
 
 def get_voice_examples(user_id: int, limit: int = 3) -> list[str]:
-    """Последние апрувнутые посты пользователя — как эталоны голоса канала."""
+    """Примеры голоса: сначала обучение voice_training, затем апрувнутые посты."""
     uid = str(user_id)
     lim = max(3, min(5, int(limit or 3)))
     try:
+        trained = get_voice_training_examples(uid, limit=lim)
+        if trained:
+            return [t[:900] for t in trained if t][:lim]
         with get_connection() as conn:
             rows = conn.execute(
                 """
@@ -1149,6 +1155,18 @@ def get_pending_feedback(user_id: int) -> dict[str, Any] | None:
 
 def pop_pending_feedback(user_id: int) -> dict[str, Any] | None:
     return _pending_feedback.pop(user_id, None)
+
+
+def set_pending_learning(user_id: int, original_text: str) -> None:
+    _pending_learning[user_id] = (original_text or "").strip()
+
+
+def get_pending_learning(user_id: int) -> str | None:
+    return _pending_learning.get(user_id)
+
+
+def pop_pending_learning(user_id: int) -> str | None:
+    return _pending_learning.pop(user_id, None)
 
 
 EDITORIAL_DISTILL_EVERY = 5

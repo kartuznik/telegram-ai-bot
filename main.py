@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import random
 import re
 import time
 import mimetypes
@@ -58,6 +59,7 @@ from app.content_editor import (
     extract_tg_channel_username_from_url,
     MAX_PENDING_UNAPPROVED_DRAFTS,
     MAX_SEARCH_WINDOW_DAYS,
+    LEARNING_OWNER_ID,
     MIN_SEARCH_WINDOW_DAYS,
     build_editor_keyboard,
     bump_approve,
@@ -76,6 +78,7 @@ from app.content_editor import (
     get_oldest_draft,
     get_pending_edit,
     get_pending_feedback,
+    get_pending_learning,
     is_draft_expired,
     get_source_mode,
     hint_for_reject_from_draft,
@@ -98,10 +101,12 @@ from app.content_editor import (
     parse_editor_extra_directives,
     pop_pending_edit,
     pop_pending_feedback,
+    pop_pending_learning,
     reset_editor_reject_state,
     set_draft_status,
     set_pending_edit,
     set_pending_feedback,
+    set_pending_learning,
     split_source_command_tokens,
     split_topic_command_tokens,
     sources_list_from_pref,
@@ -122,10 +127,13 @@ from app.scenario_simulator import (
     run_scenario_expand,
 )
 from app.database import (
+    count_voice_training_examples,
     get_editorial_feedbacks_baseline,
     get_editorial_rules,
+    get_voice_training_examples,
     init_db,
     save_draft_feedback,
+    save_voice_training,
 )
 from app.health_check import (
     OWNER_RESTART_USER_ID,
@@ -222,6 +230,7 @@ _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 EXPIRED_APPROVE_YES = "editor_expired_yes"
 EXPIRED_APPROVE_NO = "editor_expired_no"
 FEEDBACK_SKIP = "feedback_skip"
+LEARNING_SKIP = "learning_skip"
 
 _FEEDBACK_WHY_SYSTEM = (
     "Ты — Кузьма, редактор крипто-новостного канала. Пользователь только что принял решение по черновику поста "
@@ -250,6 +259,34 @@ def _feedback_skip_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Пропустить →", callback_data=FEEDBACK_SKIP)]
         ]
     )
+
+
+def _learning_skip_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить →", callback_data=LEARNING_SKIP)]
+        ]
+    )
+
+
+async def _generate_learning_source_text(owner_id: int) -> str:
+    prefs = memory.get_style_preferences(owner_id)
+    topics = topics_list_from_pref(prefs.get(PREF_TOPICS) or "")
+    topic = random.choice(topics) if topics else "актуальные новости"
+    prompt = (
+        "Напиши короткий текст (2-3 предложения) на тему "
+        f"{topic} в нейтральном информационном стиле. "
+        "Никакого юмора, никаких эмодзи. Просто факт или новость. "
+        "Владелец перепишет его своими словами — это обучение стилю."
+    )
+    text = await asyncio.to_thread(
+        agent.run_raw_completion,
+        system="Ты пишешь кратко и нейтрально, без художественности.",
+        user=prompt,
+        max_tokens=220,
+        temperature=0.9,
+    )
+    return (text or "").strip()
 
 
 async def _ask_why_after_action(
@@ -575,6 +612,47 @@ async def simulate_cmd(message: Message, bot: Bot) -> None:
         )
         return
     await _run_scenario_for_user_message(message, bot, message.from_user.id, topic)
+
+
+@router.message(Command("learning"))
+async def learning_cmd(message: Message, bot: Bot) -> None:
+    if not message.from_user or message.from_user.id != LEARNING_OWNER_ID:
+        return
+    if not is_private_chat(message):
+        await message.answer("Режим обучения доступен только в личке со мной.")
+        return
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+    try:
+        original = await _generate_learning_source_text(message.from_user.id)
+    except Exception as exc:
+        logger.exception("learning: generation error: %s", exc)
+        await message.answer("Не смог подготовить текст для обучения. Попробуй чуть позже 🙏")
+        return
+    if not original:
+        await message.answer("Не удалось собрать текст для переписывания. Попробуй ещё раз.")
+        return
+    set_pending_learning(message.from_user.id, original)
+    await message.answer(
+        f"{original}\n\nПерепиши это своими словами — как бы ты сам это сказал 🖊",
+        reply_markup=_learning_skip_keyboard(),
+    )
+
+
+@router.message(Command("learning_stats"))
+async def learning_stats_cmd(message: Message) -> None:
+    if not message.from_user or message.from_user.id != LEARNING_OWNER_ID:
+        return
+    total = count_voice_training_examples(message.from_user.id)
+    latest = get_voice_training_examples(message.from_user.id, limit=3)
+    lines = [f"Примеров в обучении: {total}"]
+    if latest:
+        lines.append("")
+        lines.append("Последние 3 переписывания:")
+        for i, txt in enumerate(latest, start=1):
+            lines.append(f"{i}) {(txt or '').strip()[:500]}")
+    else:
+        lines.append("Пока нет сохранённых примеров.")
+    await message.answer("\n".join(lines))
 
 
 async def _editor_require_private(message: Message) -> bool:
@@ -1786,6 +1864,15 @@ async def text_handler(message: Message, bot: Bot) -> None:
     text = message.text
 
     if is_private_chat(message) and not text.strip().startswith("/"):
+        pl = get_pending_learning(uid)
+        if pl is not None and uid == LEARNING_OWNER_ID:
+            rid = save_voice_training(uid, pl, text.strip())
+            pop_pending_learning(uid)
+            if rid is not None:
+                await message.answer("Записал твой стиль — учусь 📝")
+            else:
+                await message.answer("Не удалось сохранить пример. Можешь отправить переписывание ещё раз.")
+            return
         pe = get_pending_edit(uid)
         if pe is not None:
             await _handle_editor_revision_message(message, bot, pe)
@@ -2294,6 +2381,26 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
         pop_pending_feedback(user_id)
         await callback.message.answer(
             "Окей, без комментария — запомнил как пропуск ✋ В другой раз расскажешь, если захочешь."
+        )
+        return
+    if data == LEARNING_SKIP:
+        if user_id != LEARNING_OWNER_ID:
+            return
+        try:
+            original = await _generate_learning_source_text(user_id)
+        except Exception as exc:
+            logger.exception("learning_skip: generation error: %s", exc)
+            await callback.message.answer(
+                "Не смог сгенерировать новый текст. Попробуй ещё раз кнопкой или /learning."
+            )
+            return
+        if not original:
+            await callback.message.answer("Не удалось собрать новый текст. Попробуй ещё раз.")
+            return
+        set_pending_learning(user_id, original)
+        await callback.message.answer(
+            f"{original}\n\nПерепиши это своими словами — как бы ты сам это сказал 🖊",
+            reply_markup=_learning_skip_keyboard(),
         )
         return
 

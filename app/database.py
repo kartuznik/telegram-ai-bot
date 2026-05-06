@@ -157,6 +157,21 @@ def init_db() -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS voice_training (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_id TEXT NOT NULL,
+                    original_text TEXT NOT NULL,
+                    rewritten_text TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_voice_training_owner_created "
+                "ON voice_training(owner_id, created_at DESC, id DESC)"
+            )
             conn.commit()
     except Exception as exc:
         logger.exception("SQLite ошибка: %s", exc)
@@ -444,3 +459,73 @@ def get_recent_draft_feedback_window(
     except Exception as exc:
         logger.exception("get_recent_draft_feedback_window: %s", exc)
         return []
+
+
+def save_voice_training(
+    owner_id: int | str,
+    original_text: str,
+    rewritten_text: str,
+) -> int | None:
+    uid = _uid_str(owner_id)
+    src = (original_text or "").strip()
+    dst = (rewritten_text or "").strip()
+    if not src or not dst:
+        return None
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO voice_training (owner_id, original_text, rewritten_text)
+                VALUES (?, ?, ?)
+                """,
+                (uid, src, dst),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+    except Exception as exc:
+        logger.exception("save_voice_training: %s", exc)
+        return None
+
+
+def get_voice_training_examples(owner_id: int | str, limit: int = 5) -> list[str]:
+    uid = _uid_str(owner_id)
+    lim = max(1, min(int(limit), 20))
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT rewritten_text
+                FROM voice_training
+                WHERE owner_id=?
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (uid, lim),
+            ).fetchall()
+        out: list[str] = []
+        for r in rows:
+            t = str(r["rewritten_text"] or "").strip()
+            if t:
+                out.append(t)
+        return out
+    except Exception as exc:
+        logger.exception("get_voice_training_examples: %s", exc)
+        return []
+
+
+def count_voice_training_examples(owner_id: int | str) -> int:
+    uid = _uid_str(owner_id)
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM voice_training
+                WHERE owner_id=?
+                """,
+                (uid,),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+    except Exception as exc:
+        logger.exception("count_voice_training_examples: %s", exc)
+        return 0
