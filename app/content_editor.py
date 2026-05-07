@@ -2292,6 +2292,8 @@ def _pick_draft_item(
                 q[:400],
                 max_results=6,
                 days=primary_days,
+                topic="news",
+                include_published_date=True,
                 exclude_domains=promo_domains,
             )
             result_items = result.get("results") if isinstance(result, dict) else None
@@ -2306,6 +2308,8 @@ def _pick_draft_item(
                     q[:400],
                     max_results=6,
                     days=fallback_days,
+                    topic="news",
+                    include_published_date=True,
                     exclude_domains=promo_domains,
                 )
             if result and isinstance(result.get("results"), list):
@@ -2325,6 +2329,8 @@ def _pick_draft_item(
                     q[:400],
                     max_results=3,
                     days=primary_days,
+                    topic="news",
+                    include_published_date=True,
                     exclude_domains=promo_domains,
                 )
                 result_items = result.get("results") if isinstance(result, dict) else None
@@ -2339,6 +2345,8 @@ def _pick_draft_item(
                         q[:400],
                         max_results=3,
                         days=fallback_days,
+                        topic="news",
+                        include_published_date=True,
                         exclude_domains=promo_domains,
                     )
                 n_added = _append_tavily_items_to_candidates(result)
