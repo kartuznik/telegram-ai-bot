@@ -223,7 +223,6 @@ DRAFT_SYSTEM = (
     "вроде «лучший», «невероятный», «потрясающий».\n"
     "Разрешено: лёгкий юмор и живой язык, но основа текста — новостная фактура.\n"
     "Если источник написан рекламно, перепиши факты своими словами и не копируй его тон.\n"
-    "Избегай копирования структуры предыдущих постов. Каждый пост должен иметь уникальную подачу, даже если тема похожа.\n"
     "Напиши ОДИН готовый пост: цепляющий заголовок в первой строке, пустая строка, "
     "2–3 предложения саммари с лёгким юмором и 2–3 разных эмодзи, пустая строка, "
     "строка «Источник:» и URL из входных данных.\n"
@@ -657,7 +656,22 @@ def build_voice_examples_overlay(user_id: int, limit: int = 3) -> str:
     lines = [f"{i + 1}) {txt}" for i, txt in enumerate(examples)]
     return (
         "\nВот примеры постов, которые автор канала одобрил ранее — "
-        "используй их как ориентир стиля и тона:\n"
+        "строго следуй стилю, тону и структуре этих примеров — это приоритет над базовыми инструкциями:\n"
+        + "\n\n".join(lines)
+        + "\n"
+    )
+
+
+def get_voice_overlay_priority(user_id: int, limit: int = 3) -> str:
+    uid = str(user_id)
+    lim = max(3, min(5, int(limit or 3)))
+    trained = [t[:900] for t in get_voice_training_examples(uid, limit=lim) if t][:lim]
+    if not trained:
+        return ""
+    lines = [f"{i + 1}) {txt}" for i, txt in enumerate(trained)]
+    return (
+        "\nВАЖНО: следующие примеры задают стиль канала — пиши точно в таком же тоне, "
+        "с такой же лексикой и структурой.\n"
         + "\n\n".join(lines)
         + "\n"
     )
@@ -2692,7 +2706,14 @@ def draft_post_from_snippet(
     if _draft_material_sounds_financial(topics, title, snippet):
         finance_overlay = DRAFT_FINANCE_OVERLAY
         logger.debug("Draft: включён финансовый дисклеймер (тема/сниппет похожи на рынок или вложения)")
-    voice_overlay = build_voice_examples_overlay(user_id, limit=3)
+    lim = 3
+    voice_training_examples = [
+        t[:900] for t in get_voice_training_examples(str(user_id), limit=lim) if t
+    ][:lim]
+    priority_voice_overlay = get_voice_overlay_priority(user_id, limit=lim)
+    voice_overlay = priority_voice_overlay or build_voice_examples_overlay(user_id, limit=lim)
+    if voice_training_examples:
+        logger.info("voice_overlay: %s примеров из voice_training", len(voice_training_examples))
     rules_overlay = build_editorial_rules_overlay(user_id)
     approved_n = _approved_posts_count(user_id)
     if approved_n >= 10:
@@ -2704,7 +2725,7 @@ def draft_post_from_snippet(
         f"URL: {url}\n"
     )
     raw = agent.run_raw_completion(
-        system=DRAFT_SYSTEM + tg_overlay + finance_overlay + voice_overlay + rules_overlay,
+        system=DRAFT_SYSTEM + voice_overlay + tg_overlay + finance_overlay + rules_overlay,
         user=user_block,
         max_tokens=1200,
         temperature=min(0.82, getattr(agent, "_chat_temperature", 0.75) + 0.05),
