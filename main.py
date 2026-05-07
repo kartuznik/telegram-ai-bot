@@ -642,9 +642,10 @@ async def learning_cmd(message: Message, bot: Bot) -> None:
 async def learning_stats_cmd(message: Message) -> None:
     if not message.from_user or message.from_user.id != LEARNING_OWNER_ID:
         return
-    total = count_voice_training_examples(message.from_user.id)
-    latest = get_voice_training_examples(message.from_user.id, limit=3)
-    lines = [f"Примеров в обучении: {total}"]
+    uid = message.from_user.id
+    total = count_voice_training_examples(uid)
+    latest = get_voice_training_examples(uid, limit=3)
+    lines = [f"📚 Накоплено примеров: {total}"]
     if latest:
         lines.append("")
         lines.append("Последние 3 переписывания:")
@@ -652,6 +653,40 @@ async def learning_stats_cmd(message: Message) -> None:
             lines.append(f"{i}) {(txt or '').strip()[:500]}")
     else:
         lines.append("Пока нет сохранённых примеров.")
+
+    prefs = memory.get_style_preferences(uid)
+    topics = topics_list_from_pref(prefs.get(PREF_TOPICS) or "")
+    random_topic = random.choice(topics) if topics else "актуальные новости"
+    demo = ""
+    style_examples = get_voice_training_examples(uid, limit=5)
+    if style_examples:
+        examples_list = "\n\n".join(
+            f"{i + 1}) {(txt or '').strip()[:700]}" for i, txt in enumerate(style_examples) if txt
+        )
+        if examples_list:
+            demo_prompt = (
+                f"Напиши короткий текст (2-3 предложения) на тему {random_topic} "
+                "строго в стиле следующих примеров: "
+                f"{examples_list}. "
+                "Копируй лексику, тон, структуру, юмор и подачу из примеров. "
+                "Никакого корпоративного языка, только живой стиль как в примерах."
+            )
+            try:
+                demo = await asyncio.to_thread(
+                    agent.run_raw_completion,
+                    system="Ты пишешь живо, разговорно и по-человечески, строго повторяя стиль примеров.",
+                    user=demo_prompt,
+                    max_tokens=280,
+                    temperature=0.8,
+                )
+            except Exception as exc:
+                logger.warning("learning_stats: demo generation failed user_id=%s: %s", uid, exc)
+                demo = ""
+    lines.append("")
+    lines.append("🎭 Демо в твоём стиле:")
+    lines.append((demo or "Пока не удалось сгенерировать демо-текст. Попробуй ещё раз.").strip()[:700])
+    lines.append("")
+    lines.append("Напиши /learning чтобы добавить ещё пример")
     await message.answer("\n".join(lines))
 
 
