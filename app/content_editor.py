@@ -72,6 +72,26 @@ PREF_DRAFT_DEADLINE_HOURS = "content_editor_draft_deadline_hours"
 PREF_SEARCH_WINDOW_DAYS = "content_editor_search_window_days"
 PREF_PICK_FAIL_STREAK = "content_editor_pick_fail_streak"
 
+# Inline «выбор темы», если автопоиск не нашёл черновик
+CALLBACK_DRAFT_TOPIC_PREFIX = "draft_topic"
+
+DRAFT_TOPIC_PICKER_INTRO = (
+    "Не нашёл подходящих черновиков. Выбери тему для поиска:\n\n"
+    "1️⃣ Технологии\n"
+    "2️⃣ Наука\n"
+    "3️⃣ Кино\n"
+    "4️⃣ Музыка\n"
+    "5️⃣ Свой вариант (напиши тему)\n\n"
+    "Или расширь темы: /editor_prefs"
+)
+
+POPULAR_DRAFT_TOPIC_SLUGS: tuple[tuple[str, str], ...] = (
+    ("tech", "1️⃣ Технологии"),
+    ("science", "2️⃣ Наука"),
+    ("movie", "3️⃣ Кино"),
+    ("music", "4️⃣ Музыка"),
+)
+
 DEFAULT_AUTO_INTERVAL_HOURS = 0.5
 MIN_AUTO_INTERVAL_HOURS = 0.5
 MAX_AUTO_INTERVAL_HOURS = 168
@@ -1354,6 +1374,46 @@ def build_editor_keyboard(draft_id: int) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def draft_topic_slug_to_query_prefix(slug: str) -> str:
+    return {
+        "tech": "технологии",
+        "science": "наука",
+        "movie": "кино",
+        "music": "музыка",
+    }.get((slug or "").strip().lower(), (slug or "").strip())
+
+
+def build_draft_topic_picker_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"{CALLBACK_DRAFT_TOPIC_PREFIX}:{slug}",
+            )
+        ]
+        for slug, label in POPULAR_DRAFT_TOPIC_SLUGS
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="5️⃣ Свой вариант",
+                callback_data=f"{CALLBACK_DRAFT_TOPIC_PREFIX}:custom",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def is_draft_picker_failure_message(msg: str) -> bool:
+    if not msg:
+        return False
+    needles = (
+        "Ничего подходящего не нашёл",
+        "С публичных TG-каналов сейчас пусто",
+    )
+    return any(n in msg for n in needles)
 
 
 def _reject_list(prefs: dict[str, str]) -> list[str]:
@@ -2998,10 +3058,21 @@ def create_draft_from_search(
     user_id: int,
     *,
     excluded_urls: set[str] | None = None,
+    temporary_topic: str | None = None,
 ) -> tuple[bool, int | str, str | None]:
     if not is_editor_enabled(memory, user_id):
         return False, "Редактор выключен — жми /editor_start в этом чате, и я проснусь ✍️", None
-    prefs = _prefs(memory, user_id)
+    base_prefs = _prefs(memory, user_id)
+    if temporary_topic and str(temporary_topic).strip():
+        prefs = dict(base_prefs)
+        prefs[PREF_TOPICS] = str(temporary_topic).strip()[:500]
+        logger.info(
+            "create_draft_from_search: user_id=%s temporary_topic=%r",
+            user_id,
+            prefs[PREF_TOPICS][:200],
+        )
+    else:
+        prefs = base_prefs
     pending_n = count_drafts(user_id, "draft")
     if pending_n >= MAX_PENDING_UNAPPROVED_DRAFTS:
         logger.info(
@@ -3178,6 +3249,31 @@ def create_draft_from_search(
     if not row:
         return False, "Черновик создался, но не читается из базы — мистика БД 🫠", None
     return True, int(res), draft_dm_text(row)
+
+
+def create_draft_for_specific_topic(
+    agent: LLMAgent,
+    memory: ChatMemory,
+    user_id: int,
+    topic_name: str,
+    *,
+    excluded_urls: set[str] | None = None,
+) -> tuple[bool, int | str, str | None]:
+    topic_clean = (topic_name or "").strip()
+    if len(topic_clean) < 2:
+        return False, "Слишком короткая тема — напиши пару слов 🔎", None
+    logger.info(
+        "create_draft_for_specific_topic: user_id=%s topic=%r",
+        user_id,
+        topic_clean[:200],
+    )
+    return create_draft_from_search(
+        agent,
+        memory,
+        user_id,
+        excluded_urls=excluded_urls,
+        temporary_topic=topic_clean[:500],
+    )
 
 
 def maybe_note_shorter_edit(memory: ChatMemory, user_id: int, old: str, new: str) -> None:

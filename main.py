@@ -62,11 +62,16 @@ from app.content_editor import (
     LEARNING_OWNER_ID,
     MIN_SEARCH_WINDOW_DAYS,
     build_editor_keyboard,
+    build_draft_topic_picker_keyboard,
     bump_approve,
+    CALLBACK_DRAFT_TOPIC_PREFIX,
     channel_publish_text_from_draft_body,
     count_drafts,
+    create_draft_for_specific_topic,
     create_draft_from_search,
+    DRAFT_TOPIC_PICKER_INTRO,
     draft_dm_text,
+    draft_topic_slug_to_query_prefix,
     build_editorial_rules_overlay,
     build_voice_examples_overlay,
     format_auto_interval_label,
@@ -87,6 +92,7 @@ from app.content_editor import (
     is_auto_enabled_pref,
     is_editor_callback,
     is_editor_enabled,
+    is_draft_picker_failure_message,
     is_private_chat,
     maybe_distill_editorial_rules_sync,
     merge_sources_into_pref,
@@ -231,6 +237,20 @@ EXPIRED_APPROVE_YES = "editor_expired_yes"
 EXPIRED_APPROVE_NO = "editor_expired_no"
 FEEDBACK_SKIP = "feedback_skip"
 LEARNING_SKIP = "learning_skip"
+
+_pending_custom_draft_topic: set[int] = set()
+
+
+def _set_pending_custom_draft_topic(user_id: int) -> None:
+    _pending_custom_draft_topic.add(user_id)
+
+
+def _pop_pending_custom_draft_topic(user_id: int) -> bool:
+    if user_id in _pending_custom_draft_topic:
+        _pending_custom_draft_topic.discard(user_id)
+        return True
+    return False
+
 
 _FEEDBACK_WHY_SYSTEM = (
     "Ты — Кузьма, редактор крипто-новостного канала. Пользователь только что принял решение по черновику поста "
@@ -717,6 +737,63 @@ async def _editor_require_private_message(
     return True
 
 
+async def _create_draft_for_specific_topic_message(
+    message: Message,
+    bot: Bot,
+    *,
+    acting_user_id: int,
+    topic_query: str,
+    log_label: str,
+) -> None:
+    """Поиск и черновик по явной теме (кнопка или текст после «свой вариант»)."""
+    if not await _editor_require_private_message(message, acting_user_id=acting_user_id):
+        return
+    logger.info(
+        "User %s draft by topic (%s): %r",
+        acting_user_id,
+        log_label,
+        (topic_query or "")[:200],
+    )
+    if not is_editor_enabled(memory, acting_user_id):
+        await message.answer(
+            "Сначала /editor_start — без этого я не знаю, что тебе подкладывать в ленту ✍️"
+        )
+        return
+    prefs_dm = memory.get_style_preferences(acting_user_id)
+    if get_source_mode(prefs_dm) == "web" and not agent.tavily:
+        await message.answer(
+            "Tavily не настроен — в режиме источники:web без веб-поиска не обойтись. Добавь TAVILY_API_KEY в .env "
+            "или поставь /editor_prefs источники:tg / both (both без ключа попробует хотя бы TG) 🌐"
+        )
+        return
+    pending = count_drafts(acting_user_id, "draft")
+    if pending >= MAX_PENDING_UNAPPROVED_DRAFTS:
+        await message.answer(
+            f"Уже {MAX_PENDING_UNAPPROVED_DRAFTS} неразобранных черновиков в очереди — новый не создаю. "
+            "Разгреби ✅/✏️/❌ по текущим, потом снова /drafts ещё 📎"
+        )
+        return
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+    ok, res, _dm = await asyncio.to_thread(
+        create_draft_for_specific_topic,
+        agent,
+        memory,
+        acting_user_id,
+        topic_query,
+    )
+    if not ok:
+        await message.answer(str(res))
+        return
+    row = get_draft(acting_user_id, int(res))
+    if not row:
+        await message.answer("Черновик создался, но я его не вижу — глюк матрицы 🫠")
+        return
+    await message.answer(
+        draft_dm_text(row),
+        reply_markup=build_editor_keyboard(int(res)),
+    )
+
+
 async def _create_new_draft_for_user(
     message: Message,
     bot: Bot,
@@ -753,7 +830,13 @@ async def _create_new_draft_for_user(
         create_draft_from_search, agent, memory, acting_user_id
     )
     if not ok:
-        await message.answer(str(res))
+        if is_draft_picker_failure_message(str(res)):
+            await message.answer(
+                DRAFT_TOPIC_PICKER_INTRO,
+                reply_markup=build_draft_topic_picker_keyboard(),
+            )
+        else:
+            await message.answer(str(res))
         return
     row = get_draft(acting_user_id, int(res))
     if not row:
@@ -2007,6 +2090,26 @@ async def text_handler(message: Message, bot: Bot) -> None:
                     "Не вышло сохранить комментарий — глюк на линии. Можешь написать ещё раз одним сообщением или продолжить с /drafts 📎"
                 )
             return
+        if _pop_pending_custom_draft_topic(uid):
+            topic = text.strip()
+            if len(topic) < 2:
+                _set_pending_custom_draft_topic(uid)
+                await message.answer("Слишком коротко — напиши тему парой слов 🔎")
+                return
+            if topic.startswith("/"):
+                _set_pending_custom_draft_topic(uid)
+                await message.answer(
+                    "Похоже на команду — напиши тему обычным текстом или снова нажми «свой вариант» в списке тем ✍️"
+                )
+                return
+            await _create_draft_for_specific_topic_message(
+                message,
+                bot,
+                acting_user_id=uid,
+                topic_query=topic,
+                log_label="draft_topic_custom_text",
+            )
+            return
 
     wants_url_draft, found_url = _should_create_draft_from_url_text(message)
     if wants_url_draft and found_url:
@@ -2503,6 +2606,32 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
         await callback.message.answer(
             f"{original}\n\nПерепиши это своими словами — как бы ты сам это сказал 🖊",
             reply_markup=_learning_skip_keyboard(),
+        )
+        return
+
+    if data.startswith(f"{CALLBACK_DRAFT_TOPIC_PREFIX}:"):
+        slug = (data.split(":", 1)[1] or "").strip().lower()
+        if not await _editor_require_private_message(
+            callback.message, acting_user_id=user_id
+        ):
+            return
+        if slug == "custom":
+            _set_pending_custom_draft_topic(user_id)
+            await callback.message.answer(
+                "Напиши тему одним сообщением — сделаю поиск и черновик 🔎"
+            )
+            return
+        topic_blob = draft_topic_slug_to_query_prefix(slug)
+        if not topic_blob:
+            await callback.message.answer("Кнопка устарела — попробуй /find_topic ещё раз.")
+            return
+        await safe_send_chat_action(bot, callback.message.chat.id, "typing")
+        await _create_draft_for_specific_topic_message(
+            callback.message,
+            bot,
+            acting_user_id=user_id,
+            topic_query=topic_blob,
+            log_label=f"draft_topic_cb:{slug}",
         )
         return
 
