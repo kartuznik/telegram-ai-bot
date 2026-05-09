@@ -2345,6 +2345,7 @@ def _pick_draft_item(
     excluded_urls: set[str] | None = None,
     *,
     _topic_kw_retry: bool = False,
+    temporary_topic: str | None = None,
 ) -> DraftPick | None:
     """Подбор материала: Tavily (web), публичные TG-каналы (t.me/s), фильтры отказов."""
     from app.tg_feed_fetcher import fetch_many_channels
@@ -2386,6 +2387,15 @@ def _pick_draft_item(
         window_size=feedback_window,
         decay_rate=decay_rate,
     )
+    temp_topic_raw = (temporary_topic or "").strip()
+    if temp_topic_raw:
+        logger.info(
+            "temporary_topic: ignoring negative preferences for this search (topic=%r)",
+            temp_topic_raw[:120],
+        )
+        cat_preferences = {
+            k: max(0.0, float(v)) for k, v in cat_preferences.items()
+        }
     feedback_cat_counts = get_feedback_category_counts_in_window(user_id, feedback_window)
     min_pref = int(getattr(cfg, "feedback_min_count_for_full_pref", 1) or 1)
     max_pref_gain = float(getattr(cfg, "feedback_pref_max_gain", 0.10) or 0.10)
@@ -2875,9 +2885,17 @@ def _pick_draft_item(
         skip_kw = False
         if USE_PATTERNS:
             if not pattern_accept:
-                n_kw += 1
-                logger.debug("Pick draft: skip patterns_not_relevant reason=%s", pattern_info)
-                continue
+                if temp_topic_raw:
+                    logger.debug(
+                        "Pick draft: temporary_topic skip topic/pattern gate (would reject) reason=%s",
+                        pattern_info,
+                    )
+                else:
+                    n_kw += 1
+                    logger.debug(
+                        "Pick draft: skip patterns_not_relevant reason=%s", pattern_info
+                    )
+                    continue
         else:
             matched_bad = ""
             for bad in kw_strings:
@@ -3150,7 +3168,13 @@ def create_draft_from_search(
     draft_seo: float | None = None
 
     for attempt in range(2):
-        picked = _pick_draft_item(agent, prefs, user_id, merged_excl)
+        picked = _pick_draft_item(
+            agent,
+            prefs,
+            user_id,
+            merged_excl,
+            temporary_topic=temporary_topic,
+        )
         if not picked:
             if attempt == 1 and prev_weak_body is not None and prev_weak_pick is not None:
                 picked = prev_weak_pick
@@ -3244,6 +3268,12 @@ def create_draft_from_search(
     )
     if not ok:
         return False, str(res), None
+    if temporary_topic and str(temporary_topic).strip():
+        logger.info(
+            "create_draft_from_search: created draft_id=%s via temporary_topic=%r (preferences ignored)",
+            int(res),
+            str(temporary_topic).strip()[:200],
+        )
     _pick_fail_streak_reset(memory, user_id)
     row = get_draft(user_id, int(res))
     if not row:
