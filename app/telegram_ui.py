@@ -51,6 +51,8 @@ def build_health_bot_commands() -> list[BotCommand]:
 def build_admin_bot_commands() -> list[BotCommand]:
     """Полное меню для ADMIN_ID (пользовательские + служебные)."""
     return build_user_bot_commands() + [
+        BotCommand(command="learning", description="[Владелец] Режим обучения голосу"),
+        BotCommand(command="learning_stats", description="[Владелец] Статистика обучения"),
         BotCommand(command="stats", description="[Админ] Статистика бота"),
         BotCommand(command="admin", description="[Админ] Панель администратора"),
         BotCommand(command="selftest", description="[Админ] Самодиагностика (функции)"),
