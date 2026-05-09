@@ -119,7 +119,7 @@ class Config:
     )
     feedback_decay_rate: float = 0.88
     feedback_window_size: int = 20
-    feedback_min_count_for_full_pref: int = 3
+    feedback_min_count_for_full_pref: int = 1
     feedback_low_count_scale: float = 0.0
     feedback_pref_max_gain: float = 0.10
     feedback_pref_gain_per_unit: float = 0.15
@@ -178,7 +178,7 @@ def load_config() -> Config:
     blocked_domains = _parse_blocked_search_domains_env()
     feedback_decay_rate = _parse_float_env("FEEDBACK_DECAY_RATE", 0.88, 0.5, 0.999)
     feedback_window_size = _parse_int_env("FEEDBACK_WINDOW_SIZE", 20, 5, 100)
-    feedback_min_pref = _parse_int_env("FEEDBACK_MIN_COUNT_FOR_FULL_PREF", 3, 1, 50)
+    feedback_min_pref = _parse_int_env("FEEDBACK_MIN_COUNT_FOR_FULL_PREF", 1, 1, 50)
     feedback_low_scale = _parse_float_env("FEEDBACK_LOW_COUNT_SCALE", 0.0, 0.0, 1.0)
     feedback_pref_max_gain = _parse_float_env("FEEDBACK_PREF_MAX_GAIN", 0.10, 0.0, 0.5)
     feedback_pref_gain_per_unit = _parse_float_env(

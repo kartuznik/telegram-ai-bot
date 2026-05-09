@@ -2281,7 +2281,7 @@ def _pick_draft_item(
         decay_rate=decay_rate,
     )
     feedback_cat_counts = get_feedback_category_counts_in_window(user_id, feedback_window)
-    min_pref = int(getattr(cfg, "feedback_min_count_for_full_pref", 3) or 3)
+    min_pref = int(getattr(cfg, "feedback_min_count_for_full_pref", 1) or 1)
     max_pref_gain = float(getattr(cfg, "feedback_pref_max_gain", 0.10) or 0.10)
     pref_gain_per_unit = float(getattr(cfg, "feedback_pref_gain_per_unit", 0.15) or 0.15)
     novelty_bonus = float(getattr(cfg, "feedback_novelty_bonus", 0.05) or 0.05)
