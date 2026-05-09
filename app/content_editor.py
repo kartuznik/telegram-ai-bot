@@ -2193,9 +2193,20 @@ _EDITOR_SERVICE_LINES_EXACT = frozenset(
     }
 )
 
+_VERIFICATION_WARNING_HEAD_RE = re.compile(
+    r"⚠️\s*Требует проверки.*?(?=\n\n|\Z)",
+    flags=re.DOTALL,
+)
+
+
+def strip_verification_warning_block(text: str) -> str:
+    """Убирает служебный блок «⚠️ Требует проверки» (и хвост до пустой строки или конца текста)."""
+    return _VERIFICATION_WARNING_HEAD_RE.sub("", text or "").strip()
+
 
 def channel_publish_text_from_draft_body(body: str) -> str:
     """Текст для публикации в канал: без служебных строк, которые показываются только в ЛС."""
+    body = strip_verification_warning_block(body)
     lines_out: list[str] = []
     for line in (body or "").splitlines():
         stripped = line.strip()
