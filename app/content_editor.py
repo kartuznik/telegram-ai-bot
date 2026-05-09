@@ -83,7 +83,7 @@ MAX_SEARCH_WINDOW_DAYS = 30
 # Максимум черновиков в статусе draft на пользователя (ручной /drafts, авто-поиск, insert).
 MAX_PENDING_UNAPPROVED_DRAFTS = 6
 # Окна исключения source_url (подставляются из Config в init_content_editor_defaults).
-_EXCLUDE_POSTED_DAYS = 14
+_EXCLUDE_POSTED_DAYS = 30
 _EXCLUDE_REJECTED_DAYS = 7
 
 AUTO_DIRECTIVE_RE = re.compile(
@@ -110,7 +110,8 @@ TOPICS_SPACE_RE = re.compile(
 )
 
 SOURCE_MODES = frozenset({"web", "tg", "both"})
-HOST_HARD_REJECT_THRESHOLD = 4
+# Жёсткий бан домена/tg-ключа в подборе после N отказов с этим источником (см. _bump_host_reject_count).
+HOST_HARD_REJECT_THRESHOLD = 3
 URL_REJECT_PREFIX = "url:"
 VESTI_CLEANUP_USER_ID = 504425191
 LEARNING_OWNER_ID = 504425191
@@ -210,6 +211,7 @@ CB_APPROVE = "a"
 CB_EDIT = "e"
 CB_REJECT = "r"
 CB_EXPIRED = "x"  # устарел контент — не blacklist / не штраф канала
+CB_SEEN = "s"  # уже видел — исключить URL, без отказа и фидбека
 
 _pending_edit: dict[int, int] = {}
 _pending_feedback: dict[int, dict[str, Any]] = {}
@@ -467,7 +469,7 @@ def init_content_editor_defaults(cfg: Config | None = None) -> None:
     global _TG_DEFAULT_USERNAMES, _EXCLUDE_POSTED_DAYS, _EXCLUDE_REJECTED_DAYS
     if cfg is None:
         return
-    pd = int(getattr(cfg, "content_editor_exclude_posted_days", 14) or 14)
+    pd = int(getattr(cfg, "content_editor_exclude_posted_days", 30) or 30)
     rd = int(getattr(cfg, "content_editor_exclude_rejected_days", 7) or 7)
     _EXCLUDE_POSTED_DAYS = max(1, min(365, pd))
     _EXCLUDE_REJECTED_DAYS = max(1, min(365, rd))
@@ -1031,10 +1033,14 @@ def load_editor_exclude_source_urls(user_id: int) -> set[str]:
                       status = 'rejected'
                       AND datetime(created_at) >= datetime('now', ?)
                     )
+                    OR (
+                      status = 'seen'
+                      AND datetime(created_at) >= datetime('now', ?)
+                    )
                     OR (status = 'draft')
                   )
                 """,
-                (uid, f"-{posted_d} days", f"-{rej_d} days"),
+                (uid, f"-{posted_d} days", f"-{rej_d} days", f"-{rej_d} days"),
             ).fetchall()
             posted_n = conn.execute(
                 """
@@ -1309,7 +1315,7 @@ def parse_editor_callback(data: str) -> tuple[str, int | None]:
     if len(parts) != 3 or parts[0] != "editor":
         return "", None
     act, sid = parts[1], parts[2]
-    if act not in (CB_APPROVE, CB_EDIT, CB_REJECT, CB_EXPIRED):
+    if act not in (CB_APPROVE, CB_EDIT, CB_REJECT, CB_EXPIRED, CB_SEEN):
         return "", None
     try:
         return act, int(sid)
@@ -1338,6 +1344,12 @@ def build_editor_keyboard(draft_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🕐 Устарело",
                     callback_data=f"editor:{CB_EXPIRED}:{draft_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👁 Уже видел",
+                    callback_data=f"editor:{CB_SEEN}:{draft_id}",
                 ),
             ],
         ]
@@ -1747,13 +1759,20 @@ def estimate_feedback_quality_score(action: str) -> int:
 
 def _feedback_signal_from_row(action: str, quality_score: int | None) -> float:
     """Перевод feedback в сигнал -1..1 для preference."""
+    act_l = (action or "").strip().lower()
+    if act_l == "rejected":
+        # Один отказ ≈ -0.3; несколько отказов в окне усиливают негатив через среднее по категории.
+        base_r = -0.3
+        if quality_score is None:
+            return base_r
+        q = max(1, min(10, int(quality_score)))
+        q_centered = (q - 5.5) / 4.5
+        return max(-0.87, min(0.0, 0.82 * base_r + 0.18 * q_centered))
     base = {
-        # Один апрув не должен доминировать: слабее базовый сигнал, чем раньше (1.0).
         "approved": 0.4,
         "edited": 0.35,
-        "rejected": -1.0,
         "expired_content": -0.6,
-    }.get((action or "").strip().lower(), 0.0)
+    }.get(act_l, 0.0)
     if quality_score is None:
         return base
     q = max(1, min(10, int(quality_score)))
@@ -1809,7 +1828,7 @@ def recent_draft_categories(
                 SELECT content
                 FROM draft_posts
                 WHERE user_id=?
-                  AND status IN ('draft', 'posted', 'rejected')
+                  AND status IN ('draft', 'posted', 'rejected', 'seen')
                 ORDER BY id DESC
                 LIMIT ?
                 """,
@@ -1826,6 +1845,18 @@ def recent_draft_categories(
         title = txt.splitlines()[0].strip() if txt.splitlines() else txt[:120]
         out.append(detect_primary_category(title, txt[:400]))
     return out
+
+
+def _host_reject_soft_penalty_mult(host_reject_count: int) -> float:
+    """Смягчённый штраф при 1–2 отказах по тому же источнику; 3+ — жёсткий бан в подборе."""
+    n = int(host_reject_count or 0)
+    if n <= 0:
+        return 1.0
+    if n == 1:
+        return 0.7
+    if n == 2:
+        return 0.4
+    return 1.0
 
 
 def reset_editor_reject_state(memory: ChatMemory, user_id: int) -> tuple[int, int]:
@@ -2207,7 +2238,6 @@ def _snippet_from_tavily_item(it: dict[str, Any]) -> str:
 
 
 _TAVILY_MAX_CANDIDATE_AGE_DAYS = 30
-_MIN_WEB_EFFECTIVE_SCORE = 5.0
 
 
 def _tavily_published_utc(it: dict[str, Any]) -> datetime | None:
@@ -2253,6 +2283,8 @@ def _pick_draft_item(
     prefs: dict[str, str],
     user_id: int,
     excluded_urls: set[str] | None = None,
+    *,
+    _topic_kw_retry: bool = False,
 ) -> DraftPick | None:
     """Подбор материала: Tavily (web), публичные TG-каналы (t.me/s), фильтры отказов."""
     from app.tg_feed_fetcher import fetch_many_channels
@@ -2262,12 +2294,26 @@ def _pick_draft_item(
     excl_norm = {_norm_cmp_url(u).lower() for u in (excluded_urls or set()) if u}
     topics = (prefs.get(PREF_TOPICS) or "актуальные новости").strip()
     user_topics = _normalize_user_topics(topics)
+    if _topic_kw_retry:
+        user_topics = list(
+            dict.fromkeys(
+                list(user_topics) + ["событие", "развитие", "произошло"]
+            )
+        )
+        logger.info(
+            "Pick draft: повторная попытка с расширенными ключами тем (kw retry), user_id=%s",
+            user_id,
+        )
     sources = (prefs.get(PREF_SOURCES) or "").strip()
     rejects = _reject_list(prefs)
     reject_urls, hard_hosts, soft_hosts, kw_strings = _build_reject_filters(rejects, prefs)
+    host_reject_counts = _load_host_reject_counts(prefs)
     channel_quality = get_channel_quality_snapshot()
     blocked_src = frozenset(agent.config.blocked_search_domains)
     cfg = getattr(agent, "config", None)
+    min_web_eff = float(
+        getattr(cfg, "draft_pick_min_web_effective_score", 1.5) or 1.5
+    )
     feedback_window = int(getattr(cfg, "feedback_window_size", 20) or 20)
     decay_rate = float(getattr(cfg, "feedback_decay_rate", 0.95) or 0.95)
     same_cat_window = int(getattr(cfg, "diversity_same_category_window", 3) or 3)
@@ -2597,6 +2643,9 @@ def _pick_draft_item(
     ] = []
     for i, c in enumerate(candidates):
         url = (c.get("url") or "").strip()
+        rj_key_rank = _reject_host_key_for_url(url)
+        hrc = host_reject_counts.get(rj_key_rank, 0) if rj_key_rank else 0
+        rej_src_soft = _host_reject_soft_penalty_mult(hrc)
         host = _host(url).replace("www.", "")
         soft_pen = 1 if host and host in soft_hosts else 0
         if soft_pen:
@@ -2656,6 +2705,7 @@ def _pick_draft_item(
             * pref_mult
             * diversity_mult
             * novelty_mult
+            * rej_src_soft
         ) + seo_bonus_pick
         ranked.append(
             (
@@ -2730,13 +2780,17 @@ def _pick_draft_item(
                 host = host[4:]
             logger.debug("skip blocked_source_domain domain=%s url=%s", host, url[:200])
             continue
-        if (not c.get("from_tg")) and (float(sum(score_map.values()) if USE_PATTERNS else 0) * quality_mult * breaking_mult < _MIN_WEB_EFFECTIVE_SCORE):
+        raw_eff = float(sum(score_map.values()) if USE_PATTERNS else 0) * quality_mult * breaking_mult
+        rj_soft_here = _host_reject_soft_penalty_mult(
+            host_reject_counts.get(rj_key, 0) if rj_key else 0
+        )
+        if (not c.get("from_tg")) and (raw_eff * rj_soft_here < min_web_eff):
             n_low_score += 1
             logger.debug(
                 "Pick draft: skip low_effective_score url=%r eff_score=%.2f threshold=%.2f",
                 url[:120],
-                float(sum(score_map.values()) if USE_PATTERNS else 0) * quality_mult * breaking_mult,
-                _MIN_WEB_EFFECTIVE_SCORE,
+                raw_eff * rj_soft_here,
+                min_web_eff,
             )
             continue
         title = (c.get("title") or "").strip() or "Без заголовка"

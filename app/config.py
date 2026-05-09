@@ -107,8 +107,11 @@ class Config:
         "rian_ru,readovkanews,meduzalive,tass_agency,thebell_io"
     )
     # Не предлагать снова source_url из опубликованных постов (по approved_at) и отклонённых (по created_at).
-    content_editor_exclude_posted_days: int = 14
+    # POSTED_EXCLUSION_DAYS в .env — алиас к CONTENT_EDITOR_EXCLUDE_POSTED_DAYS (если задано числом).
+    content_editor_exclude_posted_days: int = 30
     content_editor_exclude_rejected_days: int = 7
+    # Мин. «эффективный» pattern-score для веб-кандидата в _pick_draft_item (× quality × breaking).
+    draft_pick_min_web_effective_score: float = 1.5
     # Блокировка доменов в редакторе (Pick draft) и в Tavily exclude_domains; переопределяется env.
     blocked_search_domains: list[str] = field(
         default_factory=lambda: list(_DEFAULT_BLOCKED_SEARCH_DOMAINS)
@@ -173,8 +176,15 @@ def load_config() -> Config:
     tg_default_ch = os.getenv("CONTENT_EDITOR_TG_DEFAULT_CHANNELS", "").strip()
     if not tg_default_ch:
         tg_default_ch = "rian_ru,readovkanews,meduzalive,tass_agency,thebell_io"
-    ex_posted = _parse_int_env("CONTENT_EDITOR_EXCLUDE_POSTED_DAYS", 14, 1, 365)
+    posted_alt = os.getenv("POSTED_EXCLUSION_DAYS", "").strip()
+    ex_posted_default = int(posted_alt) if posted_alt.isdigit() else 30
+    ex_posted = _parse_int_env(
+        "CONTENT_EDITOR_EXCLUDE_POSTED_DAYS", ex_posted_default, 1, 365
+    )
     ex_rejected = _parse_int_env("CONTENT_EDITOR_EXCLUDE_REJECTED_DAYS", 7, 1, 365)
+    draft_min_web_eff = _parse_float_env(
+        "DRAFT_PICK_MIN_WEB_EFFECTIVE_SCORE", 1.5, 0.1, 50.0
+    )
     blocked_domains = _parse_blocked_search_domains_env()
     feedback_decay_rate = _parse_float_env("FEEDBACK_DECAY_RATE", 0.88, 0.5, 0.999)
     feedback_window_size = _parse_int_env("FEEDBACK_WINDOW_SIZE", 20, 5, 100)
@@ -218,6 +228,7 @@ def load_config() -> Config:
         content_editor_tg_default_channels=tg_default_ch,
         content_editor_exclude_posted_days=ex_posted,
         content_editor_exclude_rejected_days=ex_rejected,
+        draft_pick_min_web_effective_score=draft_min_web_eff,
         blocked_search_domains=blocked_domains,
         feedback_decay_rate=feedback_decay_rate,
         feedback_window_size=feedback_window_size,

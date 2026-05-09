@@ -2729,6 +2729,39 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
                     "Жми /drafts — и закину следующий материал на разбор."
                 )
             return
+        if act == "s":
+            set_draft_status(user_id, did, "seen")
+            logger.info("editor seen: user_id=%s draft_id=%s", user_id, did)
+            await callback.message.answer(
+                "Записал как «уже видел» — этот URL отложу из подбора на время 👁 "
+                "(это не отказ и не бан источника)."
+            )
+            pending_after = count_drafts(user_id, "draft")
+            if pending_after > 0:
+                next_row = get_oldest_draft(user_id, "draft")
+                if next_row:
+                    extra = (
+                        f"\n\nВ очереди ещё {pending_after - 1} черновик(ов). "
+                        f"Хочешь добавить свежий в хвост — /drafts ещё (до {MAX_PENDING_UNAPPROVED_DRAFTS} шт.) 📎"
+                        if pending_after > 1
+                        else "\n\nЕсли захочешь ещё материал — /drafts ещё 🚀"
+                    )
+                    await callback.message.answer(
+                        draft_dm_text(next_row) + extra,
+                        reply_markup=build_editor_keyboard(int(next_row["id"])),
+                    )
+                return
+            prefs_after = memory.get_style_preferences(user_id)
+            if is_auto_enabled_pref(prefs_after):
+                await callback.message.answer(
+                    "Очередь пустая — следующий черновик может подъехать по авто. "
+                    "Не хочешь ждать — жми /drafts 📎"
+                )
+            else:
+                await callback.message.answer(
+                    "Очередь пустая — жми /drafts или /draft, подкину следующий материал 🔎"
+                )
+            return
         if act == "r":
             set_draft_status(user_id, did, "rejected")
             append_reject_hint(memory, user_id, hint_for_reject_from_draft(row))
