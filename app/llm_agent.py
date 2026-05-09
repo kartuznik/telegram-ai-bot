@@ -3,6 +3,7 @@ import json
 import re
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 import requests
@@ -289,6 +290,27 @@ class AgentResponse:
     answer: str
     buttons: list[dict[str, str]]
     is_generic: bool = False
+
+
+@dataclass
+class CrossReferenceBundle:
+    """Доп. источники для перекрёстной проверки фактов при редакторском черновике."""
+
+    prompt_block: str
+    """Текст для user/system промпта: выдержки из 2+ независимых доменов, если Tavily нашёл."""
+
+    distinct_source_hosts: int
+    """Число различных доменов среди primary URL и найденных вторичных сниппетов."""
+
+    secondary_urls: list[str]
+    """До нескольких URL независимых от основного материала."""
+
+
+def _netloc_host(url: str) -> str:
+    try:
+        return (urlparse((url or "").strip()).netloc or "").lower().lstrip("www.")
+    except Exception:
+        return ""
 
 
 class LLMAgent:
@@ -1067,3 +1089,183 @@ class LLMAgent:
 
     def web_search(self, query: str) -> str:
         return self.search_with_tavily(query)
+
+    def gather_cross_reference_for_primary(
+        self,
+        title: str,
+        snippet: str,
+        primary_url: str,
+        *,
+        exclude_domains: list[str] | None = None,
+        search_days: int = 7,
+        max_secondary: int = 3,
+    ) -> CrossReferenceBundle:
+        """Ищет 1–3 дополнительных источника на других доменах (Tavily)."""
+        primary_host = _netloc_host(primary_url)
+        if not self.tavily:
+            return CrossReferenceBundle(
+                prompt_block=(
+                    "Веб-поиск для перекрёстной проверки недоступен — опирайся только на основной материал; "
+                    "жёсткие факты без второго источника не приписывай."
+                ),
+                distinct_source_hosts=1 if primary_host else 0,
+                secondary_urls=[],
+            )
+
+        q = re.sub(r"\s+", " ", f"{title} {snippet}".strip())[:400]
+        excl = list(exclude_domains or [])
+        res = self._tavily_search(
+            q,
+            max_results=10,
+            days=int(max(1, min(30, search_days))),
+            topic="news",
+            include_published_date=True,
+            exclude_domains=excl,
+        )
+        items: list[dict] = []
+        if isinstance(res, dict) and isinstance(res.get("results"), list):
+            items = [x for x in res["results"] if isinstance(x, dict)]
+
+        primary_norm = (primary_url or "").strip().rstrip("/").lower()
+        seen_hosts: set[str] = set()
+        if primary_host:
+            seen_hosts.add(primary_host)
+
+        lines: list[str] = []
+        secondary_urls: list[str] = []
+        used_secondary_hosts: set[str] = set()
+        for it in items:
+            u = (it.get("url") or "").strip()
+            if not u:
+                continue
+            u_norm = u.rstrip("/").lower()
+            if primary_norm and u_norm == primary_norm:
+                continue
+            h = _netloc_host(u)
+            if not h or h == primary_host:
+                continue
+            if h in used_secondary_hosts:
+                continue
+            con = (it.get("content") or "").strip().replace("\n", " ")[:320]
+            tit = (it.get("title") or "Без заголовка").strip()
+            lines.append(f"— {tit}\n({u})\n{con}")
+            secondary_urls.append(u)
+            used_secondary_hosts.add(h)
+            seen_hosts.add(h)
+            if len(secondary_urls) >= max_secondary:
+                break
+
+        distinct_n = len(seen_hosts)
+        if lines:
+            block = (
+                "Дополнительные независимые источники (перекрёстная проверка). "
+                "Включай в пост только те факты, которые подтверждаются основным материалом "
+                "и хотя бы одним из источников ниже (или явно помечай как единственный источник). "
+                "Если источники расходятся — не выбирай одну версию как единственно верную.\n\n"
+                + "\n\n".join(lines)
+            )
+        else:
+            block = (
+                "Второй независимый источник по теме не найден — избегай категоричных формулировок "
+                "по цифрам, именам и деталям, которых нет в основном тексте задания."
+            )
+
+        return CrossReferenceBundle(
+            prompt_block=block,
+            distinct_source_hosts=max(distinct_n, 1 if primary_host else 0),
+            secondary_urls=secondary_urls,
+        )
+
+    @staticmethod
+    def _parse_factcheck_json_response(raw: str) -> dict | None:
+        """Достаёт JSON с оценкой фактчека из ответа модели (fence ```json, первый/последний {})."""
+        blob = (raw or "").strip()
+        if not blob:
+            return None
+        for header, inner, _a, _b in LLMAgent._iter_fenced_code_blocks(blob):
+            hn = header.replace(" ", "").lower()
+            if hn == "json" or hn.startswith("json"):
+                inner_s = inner.strip()
+                if inner_s:
+                    parsed = LLMAgent._json_try_load(inner_s)
+                    if isinstance(parsed, dict):
+                        return parsed
+        i = blob.find("{")
+        j = blob.rfind("}")
+        if i != -1 and j > i:
+            parsed = LLMAgent._json_try_load(blob[i : j + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        parsed = LLMAgent._json_try_load(blob)
+        if isinstance(parsed, dict):
+            return parsed
+        return None
+
+    def editorial_factcheck_scores(
+        self,
+        draft_body: str,
+        cross_ref_block: str,
+        *,
+        distinct_hosts: int,
+    ) -> tuple[int, bool, bool]:
+        """Оценка уверенности и флагов проверки для готового черновика."""
+        draft_body = (draft_body or "").strip()[:8000]
+        cross_ref_block = (cross_ref_block or "").strip()[:12000]
+
+        sys = (
+            "Ты фактчекер для короткого новостного поста. Даны черновик и выдержки источников.\n"
+            "Ответь ТОЛЬКО JSON без пояснений и без markdown: "
+            '{"confidence": <int 0-100>, "needs_review": <true|false>, "contradiction": <true|false>}\n'
+            "confidence — насколько факты в черновике согласованы с источниками (не красота текста).\n"
+            "needs_review — true, если для публикации не хватает оснований или есть риск ошибки.\n"
+            "contradiction — true, если источники или текст явно противоречат друг другу по сути."
+        )
+        user = f"--- Черновик ---\n{draft_body}\n\n--- Блок источников ---\n{cross_ref_block}"
+        try:
+            raw = self.run_raw_completion(
+                system=sys,
+                user=user,
+                max_tokens=220,
+                temperature=0.15,
+            )
+        except Exception:
+            logger.exception("editorial_factcheck_scores: LLM вызов не удался")
+            raw = ""
+
+        blob = (raw or "").strip()
+        parsed = self._parse_factcheck_json_response(blob)
+        if parsed is None:
+            logger.warning(
+                "editorial_factcheck_scores: JSON не распознан (ответ=%r…), "
+                "fallback confidence=50 needs_review=True contradiction=False",
+                blob[:200].replace("\n", " "),
+            )
+            conf = 50
+            need_rev = True
+            contrad = False
+        else:
+            conf = 50
+            need_rev = True
+            contrad = False
+            try:
+                conf = int(parsed.get("confidence", 50))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "editorial_factcheck_scores: поле confidence не число, беру 50"
+                )
+                conf = 50
+            v_nr = parsed.get("needs_review")
+            if v_nr is not None:
+                need_rev = bool(v_nr)
+            v_c = parsed.get("contradiction")
+            if v_c is not None:
+                contrad = bool(v_c)
+
+        conf = max(0, min(100, conf))
+        if distinct_hosts < 2:
+            need_rev = True
+            conf = min(conf, 52)
+        if contrad:
+            need_rev = True
+            conf = max(0, conf - 25)
+        return conf, need_rev, contrad

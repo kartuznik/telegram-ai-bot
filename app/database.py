@@ -106,6 +106,8 @@ def init_db() -> None:
                 )
                 """
             )
+            # Миграции draft_posts: SQLite не поддерживает «ADD COLUMN IF NOT EXISTS» —
+            # колонки добавляем только если их нет в PRAGMA table_info (идемпотентно).
             cols = {
                 str(r[1])
                 for r in conn.execute("PRAGMA table_info(draft_posts)").fetchall()
@@ -116,6 +118,20 @@ def init_db() -> None:
                 conn.execute(
                     "ALTER TABLE draft_posts ADD COLUMN was_edited INTEGER NOT NULL DEFAULT 0"
                 )
+            # Редакторские метрики (Кузьма / content_editor):
+            # - confidence_score: 0–100, уверенность фактчека после перекрёстных источников + LLM;
+            # - requires_verification: 1 = нужна ручная проверка (<2 доменов, противоречия, слабый JSON и т.д.);
+            # - seo_score: 0–100 (REAL), оценка SEO первой строки черновика (длина + ключевые слова тем).
+            if "confidence_score" not in cols:
+                conn.execute(
+                    "ALTER TABLE draft_posts ADD COLUMN confidence_score INTEGER"
+                )
+            if "requires_verification" not in cols:
+                conn.execute(
+                    "ALTER TABLE draft_posts ADD COLUMN requires_verification INTEGER NOT NULL DEFAULT 0"
+                )
+            if "seo_score" not in cols:
+                conn.execute("ALTER TABLE draft_posts ADD COLUMN seo_score REAL")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_draft_posts_user_status "
                 "ON draft_posts(user_id, status)"

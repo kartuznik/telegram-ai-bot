@@ -70,6 +70,7 @@ PREF_TG_CHANNELS = "content_editor_tg_channels"
 PREF_HOST_REJECT_COUNTS = "content_editor_reject_host_counts"
 PREF_DRAFT_DEADLINE_HOURS = "content_editor_draft_deadline_hours"
 PREF_SEARCH_WINDOW_DAYS = "content_editor_search_window_days"
+PREF_PICK_FAIL_STREAK = "content_editor_pick_fail_streak"
 
 DEFAULT_AUTO_INTERVAL_HOURS = 0.5
 MIN_AUTO_INTERVAL_HOURS = 0.5
@@ -1574,6 +1575,79 @@ def tavily_fallback_days_after_empty(primary: int) -> int:
     return min(max(primary, 5), MAX_SEARCH_WINDOW_DAYS)
 
 
+def _broaden_tavily_news_query(
+    original_q: str,
+    *,
+    single_topic: str | None,
+    topics_general: str,
+) -> str:
+    """Упрощённый запрос, если Tavily дважды не дал пригодных сниппетов."""
+    _ = (original_q or "").split(". Исключай или обходи")[0].strip()
+    y = f"{datetime.utcnow().year}"
+    if single_topic and single_topic.strip():
+        st = single_topic.strip()
+        return re.sub(r"\s+", " ", f"новости {st} обзор главное {y}")[:400]
+    first = (topics_general.split(",")[0] or "новости").strip()
+    return re.sub(r"\s+", " ", f"{first} новости сегодня главное события {y}")[:400]
+
+
+def _topic_keyword_hints(topics: str) -> list[str]:
+    raw = (topics or "").replace("ё", "е").lower()
+    parts = re.split(r"[,;\n]+", raw)
+    out: list[str] = []
+    for p in parts:
+        w = p.strip()
+        if len(w) >= 3:
+            out.append(w)
+    for m in re.findall(r"[a-zа-яё]{3,}", raw.replace("ё", "е")):
+        if m not in out:
+            out.append(m)
+    return out[:24]
+
+
+def _seo_score_for_title(title: str, keyword_hints: list[str]) -> tuple[int, bool]:
+    """SEO-оценка заголовка 0–100 и признак полного соответствия (длина 40–60 + ключевое слово)."""
+    t = (title or "").strip()
+    L = len(t)
+    len_ok = 40 <= L <= 60
+    low = t.lower().replace("ё", "е")
+    hints = [h for h in keyword_hints if len(h) >= 3]
+    kw_hit = any(h.lower().replace("ё", "е") in low for h in hints) if hints else True
+    len_part = 100 if len_ok else (70 if 30 <= L <= 75 else 35)
+    kw_part = 100 if kw_hit else 40
+    score = int(round((len_part + kw_part) / 2))
+    meets = len_ok and kw_hit
+    return max(0, min(100, score)), meets
+
+
+def _pick_fail_streak_get(memory: ChatMemory, user_id: int) -> int:
+    try:
+        return int(
+            (_prefs(memory, user_id).get(PREF_PICK_FAIL_STREAK) or "0").strip() or 0
+        )
+    except ValueError:
+        return 0
+
+
+def _pick_fail_streak_bump(memory: ChatMemory, user_id: int) -> int:
+    n = _pick_fail_streak_get(memory, user_id) + 1
+    memory.update_style_preferences(user_id, {PREF_PICK_FAIL_STREAK: str(n)})
+    return n
+
+
+def _pick_fail_streak_reset(memory: ChatMemory, user_id: int) -> None:
+    memory.update_style_preferences(user_id, {PREF_PICK_FAIL_STREAK: "0"})
+
+
+def _exhaustion_message_suffix(streak: int) -> str:
+    if streak >= 3:
+        return (
+            "\n\nТема исчерпана или слишком узкая — попробовать другую? "
+            "Загляни в /topics 🔁"
+        )
+    return ""
+
+
 def format_search_window_settings_message(prefs: dict[str, str]) -> str:
     """Текст сводки для /searchwindow (Tavily days + fallback)."""
     raw = (prefs.get(PREF_SEARCH_WINDOW_DAYS) or "").strip()
@@ -1843,6 +1917,9 @@ def insert_draft(
     source_url: str | None,
     *,
     deadline_hours: int | None = None,
+    confidence_score: int | None = None,
+    requires_verification: bool = False,
+    seo_score: float | None = None,
 ) -> tuple[bool, int | str]:
     uid = str(user_id)
     pending = count_drafts(user_id, "draft")
@@ -1869,10 +1946,22 @@ def insert_draft(
         with get_connection() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO draft_posts (user_id, channel_id, content, source_url, status, expires_at)
-                VALUES (?, ?, ?, ?, 'draft', datetime('now', ?))
+                INSERT INTO draft_posts (
+                    user_id, channel_id, content, source_url, status, expires_at,
+                    confidence_score, requires_verification, seo_score
+                )
+                VALUES (?, ?, ?, ?, 'draft', datetime('now', ?), ?, ?, ?)
                 """,
-                (uid, channel_id, body, source_url or None, f"+{ttl_h} hours"),
+                (
+                    uid,
+                    channel_id,
+                    body,
+                    source_url or None,
+                    f"+{ttl_h} hours",
+                    confidence_score,
+                    1 if requires_verification else 0,
+                    seo_score,
+                ),
             )
             conn.commit()
             return True, int(cur.lastrowid)
@@ -1887,7 +1976,8 @@ def get_draft(user_id: int, draft_id: int) -> dict[str, Any] | None:
         with get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url, expires_at
+                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at,
+                       media_url, expires_at, confidence_score, requires_verification, seo_score, was_edited
                 FROM draft_posts WHERE id=? AND user_id=?
                 """,
                 (draft_id, uid),
@@ -1954,7 +2044,8 @@ def get_latest_draft(user_id: int, status: str = "draft") -> dict[str, Any] | No
         with get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url, expires_at
+                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at,
+                       media_url, expires_at, confidence_score, requires_verification, seo_score, was_edited
                 FROM draft_posts WHERE user_id=? AND status=?
                 ORDER BY id DESC LIMIT 1
                 """,
@@ -1975,7 +2066,8 @@ def get_oldest_draft(user_id: int, status: str = "draft") -> dict[str, Any] | No
         with get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at, media_url, expires_at
+                SELECT id, user_id, channel_id, content, source_url, status, created_at, approved_at,
+                       media_url, expires_at, confidence_score, requires_verification, seo_score, was_edited
                 FROM draft_posts
                 WHERE user_id=?
                   AND status=?
@@ -2031,10 +2123,26 @@ def draft_dm_text(row: dict[str, Any]) -> str:
     sid = row.get("source_url") or ""
     head = "✍️ Черновик для канала @kriptogeograph — глянь и реши судьбу поста:\n\n"
     body = str(row.get("content") or "")
+    meta_lines: list[str] = []
+    cs = row.get("confidence_score")
+    if cs is not None:
+        try:
+            meta_lines.append(f"📊 Уверенность (фактчек): {int(cs)}%")
+        except (TypeError, ValueError):
+            pass
+    ss = row.get("seo_score")
+    if ss is not None:
+        try:
+            meta_lines.append(f"🔎 SEO заголовка: {float(ss):.0f}/100")
+        except (TypeError, ValueError):
+            pass
+    if int(row.get("requires_verification") or 0):
+        meta_lines.append("⚠️ Требуется ручная проверка фактов")
+    meta = ("\n" + "\n".join(meta_lines) + "\n\n") if meta_lines else ""
     tail = ""
     if sid:
         tail = f"\n\n🔗 Источник в базе: {sid}"
-    msg = head + body + tail
+    msg = head + meta + body + tail
     if len(msg) > 4090:
         msg = msg[:4070] + "\n…"
     return msg
@@ -2302,6 +2410,7 @@ def _pick_draft_item(
             tail = _reject_hints_for_tavily_query(rejects)
             if tail:
                 q += ". Исключай или обходи материалы, связанные с: " + ", ".join(tail)
+            mark_web = _web_candidate_count()
             result = agent._tavily_search(
                 q[:400],
                 max_results=6,
@@ -2334,11 +2443,32 @@ def _pick_draft_item(
                     mode,
                     bool(result),
                 )
+            if _web_candidate_count() == mark_web:
+                q_broad = _broaden_tavily_news_query(
+                    q, single_topic=None, topics_general=topics
+                )
+                days_3 = min(max(fallback_days, 7), MAX_SEARCH_WINDOW_DAYS)
+                logger.info(
+                    "Pick draft: веб-кандидатов всё ещё 0 — расширенный запрос Tavily, query=%r days=%s",
+                    q_broad[:220],
+                    days_3,
+                )
+                result3 = agent._tavily_search(
+                    q_broad[:400],
+                    max_results=8,
+                    days=days_3,
+                    topic="news",
+                    include_published_date=True,
+                    exclude_domains=promo_domains,
+                )
+                if result3 and isinstance(result3.get("results"), list):
+                    _append_tavily_items_to_candidates(result3)
         else:
             for topic in topics_list[:5]:
                 if _web_candidate_count() >= _TAVILY_WEB_CAP:
                     break
                 q = f"новости {topic} {date_hint}".strip()
+                mark_web = _web_candidate_count()
                 result = agent._tavily_search(
                     q[:400],
                     max_results=3,
@@ -2365,6 +2495,27 @@ def _pick_draft_item(
                     )
                 n_added = _append_tavily_items_to_candidates(result)
                 logger.info("Tavily multi-query: topic=%s results=%s", topic, n_added)
+                if _web_candidate_count() == mark_web:
+                    q_broad = _broaden_tavily_news_query(
+                        q, single_topic=topic, topics_general=topics
+                    )
+                    days_3 = min(max(fallback_days, 7), MAX_SEARCH_WINDOW_DAYS)
+                    logger.info(
+                        "Pick draft: тема %r — расширенный запрос Tavily, query=%r days=%s",
+                        topic[:80],
+                        q_broad[:220],
+                        days_3,
+                    )
+                    result3 = agent._tavily_search(
+                        q_broad[:400],
+                        max_results=8,
+                        days=days_3,
+                        topic="news",
+                        include_published_date=True,
+                        exclude_domains=promo_domains,
+                    )
+                    if result3 and isinstance(result3.get("results"), list):
+                        _append_tavily_items_to_candidates(result3)
             if _web_candidate_count() == 0:
                 logger.warning(
                     "Pick draft: web пустой или нет results (mode=%s, multi-topic)",
@@ -2495,6 +2646,9 @@ def _pick_draft_item(
         elif narrow_mix_active and category not in set(recent_cats_mix):
             diversity_mult *= 1.0 + max(0.0, min(1.0, other_cat_bonus))
         novelty_mult = (1.0 + novelty_bonus) if category not in novelty_cat_set else 1.0
+        kw_hints_pick = _topic_keyword_hints(topics)
+        _, seo_meets_pick = _seo_score_for_title(title, kw_hints_pick)
+        seo_bonus_pick = 0.5 if seo_meets_pick else 0.0
         effective_score = (
             float(total_score)
             * quality_mult
@@ -2502,7 +2656,7 @@ def _pick_draft_item(
             * pref_mult
             * diversity_mult
             * novelty_mult
-        )
+        ) + seo_bonus_pick
         ranked.append(
             (
                 soft_pen,
@@ -2693,7 +2847,10 @@ def draft_post_from_snippet(
     *,
     from_telegram: bool = False,
     telegram_channel_display: str = "",
-) -> tuple[str, bool, str]:
+    cross_ref_days: int = 7,
+    cross_ref_exclude_domains: list[str] | None = None,
+) -> tuple[str, bool, str, int, bool, int]:
+    """Черновик + метрики: качество текста, confidence 0–100, флаг проверки, seo_score 0–100."""
     tg_overlay = ""
     if from_telegram:
         disp = telegram_channel_display.strip() or "@канал"
@@ -2718,11 +2875,19 @@ def draft_post_from_snippet(
     approved_n = _approved_posts_count(user_id)
     if approved_n >= 10:
         logger.info("editor_voice: user_id=%s voice сформирован (%s+ апрувов)", user_id, approved_n)
+    bundle = agent.gather_cross_reference_for_primary(
+        title,
+        snippet,
+        url,
+        exclude_domains=cross_ref_exclude_domains,
+        search_days=cross_ref_days,
+    )
     user_block = (
         f"Темы пользователя: {topics}\n"
         f"Заголовок источника: {title}\n"
         f"Краткое содержание: {snippet}\n"
-        f"URL: {url}\n"
+        f"URL: {url}\n\n"
+        f"{bundle.prompt_block}\n"
     )
     raw = agent.run_raw_completion(
         system=DRAFT_SYSTEM + voice_overlay + tg_overlay + finance_overlay + rules_overlay,
@@ -2750,7 +2915,27 @@ def draft_post_from_snippet(
         )
     if len(text) > MAX_POST_CHARS:
         text = text[: MAX_POST_CHARS - 1] + "…"
-    return text, ok_quality, quality_reason
+
+    gen_title = (text.splitlines()[0] if text else "").strip()
+    seo_score, _ = _seo_score_for_title(gen_title, _topic_keyword_hints(topics))
+    confidence, needs_ver, contrad = agent.editorial_factcheck_scores(
+        text,
+        bundle.prompt_block,
+        distinct_hosts=bundle.distinct_source_hosts,
+    )
+    if contrad:
+        needs_ver = True
+    if bundle.distinct_source_hosts < 2:
+        needs_ver = True
+
+    logger.info(
+        "Draft metrics: seo_score=%s confidence=%s needs_verification=%s distinct_hosts=%s",
+        seo_score,
+        confidence,
+        needs_ver,
+        bundle.distinct_source_hosts,
+    )
+    return text, ok_quality, quality_reason, confidence, needs_ver, seo_score
 
 
 def create_draft_from_search(
@@ -2818,6 +3003,10 @@ def create_draft_from_search(
         logger.debug("Draft creation excluded URLs sample: %s", sample[:500])
     topics = prefs.get(PREF_TOPICS) or "новости"
     deadline_h = draft_deadline_hours_from_prefs(prefs)
+    cross_excl = list(WEB_PROMO_DOMAINS) + list(
+        getattr(agent.config, "blocked_search_domains", []) or []
+    )
+    cross_days = primary_search_window_days_from_prefs(prefs)
     cfg = getattr(agent, "config", None)
     auto_retry_weak = bool(getattr(cfg, "auto_retry_weak_drafts", False)) if cfg else False
 
@@ -2827,6 +3016,12 @@ def create_draft_from_search(
     quality_reason = "ok"
     prev_weak_body: str | None = None
     prev_weak_pick: DraftPick | None = None
+    prev_confidence = 45
+    prev_needs_ver = True
+    prev_seo = 0
+    draft_confidence: int | None = None
+    draft_needs_ver = False
+    draft_seo: float | None = None
 
     for attempt in range(2):
         picked = _pick_draft_item(agent, prefs, user_id, merged_excl)
@@ -2836,26 +3031,44 @@ def create_draft_from_search(
                 body = _append_weak_draft_marker(prev_weak_body)
                 ok_quality = False
                 quality_reason = "retry_no_pick"
+                draft_confidence = prev_confidence
+                draft_needs_ver = True
+                draft_seo = float(prev_seo)
                 break
+            streak = _pick_fail_streak_bump(memory, user_id)
+            ex = _exhaustion_message_suffix(streak)
             if mode == "tg":
                 return (
                     False,
                     "С публичных TG-каналов сейчас пусто — сеть, вёрстка t.me или смени список "
-                    "«тгканалы:» в /editor_prefs. Веб не используется (источники:tg) 🛰️",
+                    "«тгканалы:» в /editor_prefs. Веб не используется (источники:tg) 🛰️"
+                    + ex,
                     None,
                 )
-            return False, "Ничего подходящего не нашёл — расширь темы в /editor_prefs или попробуй позже 🔎", None
+            return (
+                False,
+                "Ничего подходящего не нашёл — расширь темы в /editor_prefs или попробуй позже 🔎"
+                + ex,
+                None,
+            )
 
-        body, ok_quality, quality_reason = draft_post_from_snippet(
-            agent,
-            user_id,
-            picked.title,
-            picked.snippet,
-            picked.url,
-            topics,
-            from_telegram=picked.from_telegram,
-            telegram_channel_display=picked.telegram_display,
+        body, ok_quality, quality_reason, confidence, needs_ver, seo_score = (
+            draft_post_from_snippet(
+                agent,
+                user_id,
+                picked.title,
+                picked.snippet,
+                picked.url,
+                topics,
+                from_telegram=picked.from_telegram,
+                telegram_channel_display=picked.telegram_display,
+                cross_ref_days=cross_days,
+                cross_ref_exclude_domains=cross_excl,
+            )
         )
+        draft_confidence = confidence
+        draft_needs_ver = needs_ver
+        draft_seo = float(seo_score)
         if ok_quality:
             break
         if auto_retry_weak and attempt < 1:
@@ -2871,12 +3084,20 @@ def create_draft_from_search(
                 if nu:
                     merged_excl.add(nu.lower())
             prev_weak_body, prev_weak_pick = body, picked
+            prev_confidence, prev_needs_ver, prev_seo = confidence, needs_ver, seo_score
             continue
         body = _append_weak_draft_marker(body)
+        draft_needs_ver = True
         break
 
     if picked is None:
-        return False, "Ничего подходящего не нашёл — расширь темы в /editor_prefs или попробуй позже 🔎", None
+        streak = _pick_fail_streak_bump(memory, user_id)
+        ex = _exhaustion_message_suffix(streak)
+        return (
+            False,
+            "Ничего подходящего не нашёл — расширь темы в /editor_prefs или попробуй позже 🔎" + ex,
+            None,
+        )
 
     logger.info(
         "create_draft_from_search: черновик после GPT, len=%s, source_url=%r tg=%s",
@@ -2891,9 +3112,13 @@ def create_draft_from_search(
         body,
         picked.url,
         deadline_hours=deadline_h,
+        confidence_score=draft_confidence,
+        requires_verification=draft_needs_ver,
+        seo_score=draft_seo,
     )
     if not ok:
         return False, str(res), None
+    _pick_fail_streak_reset(memory, user_id)
     row = get_draft(user_id, int(res))
     if not row:
         return False, "Черновик создался, но не читается из базы — мистика БД 🫠", None
