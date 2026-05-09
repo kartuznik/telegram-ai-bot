@@ -701,6 +701,70 @@ async def _editor_require_private(message: Message) -> bool:
     return True
 
 
+async def _editor_require_private_message(
+    message: Message,
+    *,
+    acting_user_id: int | None,
+) -> bool:
+    """Для callback: у Message может не быть from_user — передаём acting_user_id."""
+    if not is_private_chat(message):
+        await message.answer(
+            "Редактор контента — только в личке со мной. Напиши мне в ЛС: там черновики и кнопки апрува ✍️😊"
+        )
+        return False
+    if acting_user_id is None:
+        return False
+    return True
+
+
+async def _create_new_draft_for_user(
+    message: Message,
+    bot: Bot,
+    *,
+    acting_user_id: int,
+    log_label: str,
+) -> None:
+    """Создать новый черновик из поиска (как «/drafts ещё» без показа старого из очереди)."""
+    if not await _editor_require_private_message(message, acting_user_id=acting_user_id):
+        return
+    logger.info("User %s requested draft creation (%s)", acting_user_id, log_label)
+    if not is_editor_enabled(memory, acting_user_id):
+        await message.answer(
+            "Сначала /editor_start — без этого я не знаю, что тебе подкладывать в ленту ✍️"
+        )
+        return
+    prefs_dm = memory.get_style_preferences(acting_user_id)
+    if get_source_mode(prefs_dm) == "web" and not agent.tavily:
+        await message.answer(
+            "Tavily не настроен — в режиме источники:web без веб-поиска не обойтись. Добавь TAVILY_API_KEY в .env "
+            "или поставь /editor_prefs источники:tg / both (both без ключа попробует хотя бы TG) 🌐"
+        )
+        return
+    pending = count_drafts(acting_user_id, "draft")
+    if pending >= MAX_PENDING_UNAPPROVED_DRAFTS:
+        await message.answer(
+            f"Уже {MAX_PENDING_UNAPPROVED_DRAFTS} неразобранных черновиков в очереди — новый не создаю. "
+            "Разгреби ✅/✏️/❌ по текущим, потом снова /drafts ещё 📎"
+        )
+        return
+    logger.info("Starting draft search for user %s (%s)", acting_user_id, log_label)
+    await safe_send_chat_action(bot, message.chat.id, "typing")
+    ok, res, _dm = await asyncio.to_thread(
+        create_draft_from_search, agent, memory, acting_user_id
+    )
+    if not ok:
+        await message.answer(str(res))
+        return
+    row = get_draft(acting_user_id, int(res))
+    if not row:
+        await message.answer("Черновик создался, но я его не вижу — глюк матрицы 🫠")
+        return
+    await message.answer(
+        draft_dm_text(row),
+        reply_markup=build_editor_keyboard(int(res)),
+    )
+
+
 async def _require_owner_private(message: Message) -> bool:
     """Настройки поиска: только владелец (ADMIN_ID) в личке."""
     if not await _editor_require_private(message) or not message.from_user:
@@ -1629,18 +1693,8 @@ async def drafts_cmd(message: Message, bot: Bot) -> None:
                 "Разгреби ✅/✏️/❌ по текущим, потом снова /drafts ещё 📎"
             )
             return
-        await safe_send_chat_action(bot, message.chat.id, "typing")
-        ok, res, _dm = await asyncio.to_thread(create_draft_from_search, agent, memory, uid)
-        if not ok:
-            await message.answer(str(res))
-            return
-        row = get_draft(uid, int(res))
-        if not row:
-            await message.answer("Черновик создался, но я его не вижу — глюк матрицы 🫠")
-            return
-        await message.answer(
-            draft_dm_text(row),
-            reply_markup=build_editor_keyboard(int(res)),
+        await _create_new_draft_for_user(
+            message, bot, acting_user_id=uid, log_label="drafts_cmd_more"
         )
         return
 
@@ -1659,18 +1713,31 @@ async def drafts_cmd(message: Message, bot: Bot) -> None:
             )
             return
 
-    await safe_send_chat_action(bot, message.chat.id, "typing")
-    ok, res, _dm = await asyncio.to_thread(create_draft_from_search, agent, memory, uid)
-    if not ok:
-        await message.answer(str(res))
+    await _create_new_draft_for_user(
+        message, bot, acting_user_id=uid, log_label="drafts_cmd_new"
+    )
+
+
+@router.message(Command("draft", "find", "find_topic", "editor"))
+async def draft_find_editor_shortcuts_cmd(message: Message, bot: Bot) -> None:
+    """Короткие команды: сразу создать черновик из поиска (/editor — панель + тот же шаг)."""
+    if not message.from_user:
         return
-    row = get_draft(uid, int(res))
-    if not row:
-        await message.answer("Черновик создался, но я его не вижу — глюк матрицы 🫠")
-        return
-    await message.answer(
-        draft_dm_text(row),
-        reply_markup=build_editor_keyboard(int(res)),
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+    cmd0 = text.split(maxsplit=1)[0] if text else ""
+    cmd = cmd0.split("@", 1)[0].lstrip("/").lower()
+    if cmd == "editor":
+        await message.answer(
+            "📝 Редактор канала\n\n"
+            "• /editor_start — включить редактор\n"
+            "• /draft, /find, /find_topic — найти тему и собрать черновик\n"
+            "• /drafts — очередь черновиков и решения ✅ ✏️ ❌\n"
+            "• /editor_prefs — темы, источники, авто-поиск\n\n"
+            "Дальше закидываю свежую подборку по твоим темам 🔎",
+        )
+    await _create_new_draft_for_user(
+        message, bot, acting_user_id=uid, log_label=f"cmd_{cmd}"
     )
 
 
@@ -2795,6 +2862,13 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             user_query=query or None,
         )
         await send_ai_reply(callback.message, response.answer, buttons)
+    elif data == "find_draft_topic":
+        await _create_new_draft_for_user(
+            callback.message,
+            bot,
+            acting_user_id=user_id,
+            log_label="callback_find_draft_topic",
+        )
     elif data in {"web_search", "latest_updates"}:
         history = memory.get(user_id)
         last_user_message = next(

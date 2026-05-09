@@ -2959,7 +2959,7 @@ def create_draft_from_search(
         return (
             False,
             f"На подоконнике уже {MAX_PENDING_UNAPPROVED_DRAFTS} неразобранных черновиков — новый не создаю. "
-            "Разгреби ✅/✏️/❌, потом снова /drafts или /drafts ещё 📎",
+            "Разгреби ✅/✏️/❌, потом снова /drafts, /draft или /drafts ещё 📎",
             None,
         )
     logger.info(
@@ -2968,6 +2968,7 @@ def create_draft_from_search(
         pending_n,
         MAX_PENDING_UNAPPROVED_DRAFTS,
     )
+    logger.info("Starting draft search for user %s", user_id)
     mode = get_source_mode(prefs)
     if editor_needs_tavily(prefs) and not agent.tavily:
         if mode == "web":

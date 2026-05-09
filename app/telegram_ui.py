@@ -33,6 +33,10 @@ def build_user_bot_commands() -> list[BotCommand]:
         BotCommand(command="editor_rules", description="Правила редактора для черновиков"),
         BotCommand(command="editor_reset_rejects", description="Сброс отказов и банов каналов"),
         BotCommand(command="drafts", description="Черновики постов для канала"),
+        BotCommand(command="draft", description="🔍 Найти тему для черновика"),
+        BotCommand(command="find_topic", description="Найти тему (черновик)"),
+        BotCommand(command="find", description="Найти тему (черновик)"),
+        BotCommand(command="editor", description="Панель редактора + черновик"),
         BotCommand(command="bookmarks", description="Якоря в диалоге"),
         BotCommand(command="templates", description="Шаблоны ответов"),
         BotCommand(command="clear", description="Очистить историю диалога"),
@@ -251,12 +255,42 @@ def build_keyboard_from_buttons(buttons: list[dict[str, str]]) -> InlineKeyboard
 
 def build_default_keyboard() -> tuple[InlineKeyboardMarkup, list[dict[str, str]]]:
     buttons = [
+        {"text": "🔍 Найти тему (черновик)", "callback_data": "find_draft_topic"},
         {"text": "🔍 Поиск в вебе", "callback_data": "web_search"},
         {"text": "🔄 Свежие обновления", "callback_data": "latest_updates"},
         {"text": "Углубиться в тему 🎯", "callback_data": "deep_dive"},
         {"text": "🗑️ Очистить историю", "callback_data": "clear_history"},
     ]
 
-    keyboard = build_keyboard_from_buttons(buttons)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔍 Найти тему (черновик)",
+                    callback_data="find_draft_topic",
+                ),
+                InlineKeyboardButton(
+                    text="🔍 Поиск в вебе",
+                    callback_data="web_search",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Свежие обновления",
+                    callback_data="latest_updates",
+                ),
+                InlineKeyboardButton(
+                    text="Углубиться в тему 🎯",
+                    callback_data="deep_dive",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑️ Очистить историю",
+                    callback_data="clear_history",
+                ),
+            ],
+        ]
+    )
 
     return keyboard, buttons
