@@ -2349,6 +2349,27 @@ def _freshness_terms_for_query(topics: str, sources: str) -> list[str]:
     return ["today", "yesterday", "latest news", "breaking"]
 
 
+_TAVILY_EN_RU_TOPIC_HINTS = frozenset({"twitch", "anime", "gaming"})
+
+
+def _tavily_multi_topic_query(topic: str, date_hint: str) -> str:
+    """Одна тема в multi-topic цикле: приоритет русскоязычных и RU-контекста."""
+    t = (topic or "").strip()
+    if not t:
+        return f"новости Россия {date_hint}".strip()
+    tl = t.lower()
+    has_cyrillic = bool(re.search(r"[а-яё]", tl))
+    base = f"новости {t} Россия {date_hint}".strip()
+    if has_cyrillic:
+        return base
+    tokens = {tok for tok in re.split(r"[\s,_.\-/]+", tl) if tok}
+    if tokens & _TAVILY_EN_RU_TOPIC_HINTS or any(
+        k in tl for k in _TAVILY_EN_RU_TOPIC_HINTS
+    ):
+        return f"новости {t} русский Россия {date_hint}".strip()
+    return base
+
+
 def _pick_draft_item(
     agent: LLMAgent,
     prefs: dict[str, str],
@@ -2533,7 +2554,8 @@ def _pick_draft_item(
         if not topics_list:
             freshness_terms = _freshness_terms_for_query(topics, sources)
             freshness_hint = " ".join(freshness_terms)
-            q = f"{topics} {sources} {freshness_hint} {date_hint}".strip()
+            lead = f"{topics} {sources} {freshness_hint}".strip()
+            q = f"{lead} новости на русском {date_hint}".strip()
             tail = _reject_hints_for_tavily_query(rejects)
             if tail:
                 q += ". Исключай или обходи материалы, связанные с: " + ", ".join(tail)
@@ -2543,6 +2565,7 @@ def _pick_draft_item(
                 max_results=6,
                 days=primary_days,
                 topic="news",
+                country="RU",
                 include_published_date=True,
                 exclude_domains=promo_domains,
             )
@@ -2559,6 +2582,7 @@ def _pick_draft_item(
                     max_results=6,
                     days=fallback_days,
                     topic="news",
+                    country="RU",
                     include_published_date=True,
                     exclude_domains=promo_domains,
                 )
@@ -2585,6 +2609,7 @@ def _pick_draft_item(
                     max_results=8,
                     days=days_3,
                     topic="news",
+                    country="RU",
                     include_published_date=True,
                     exclude_domains=promo_domains,
                 )
@@ -2594,13 +2619,14 @@ def _pick_draft_item(
             for topic in topics_list[:5]:
                 if _web_candidate_count() >= _TAVILY_WEB_CAP:
                     break
-                q = f"новости {topic} {date_hint}".strip()
+                q = _tavily_multi_topic_query(topic, date_hint)
                 mark_web = _web_candidate_count()
                 result = agent._tavily_search(
                     q[:400],
                     max_results=3,
                     days=primary_days,
                     topic="news",
+                    country="RU",
                     include_published_date=True,
                     exclude_domains=promo_domains,
                 )
@@ -2617,6 +2643,7 @@ def _pick_draft_item(
                         max_results=3,
                         days=fallback_days,
                         topic="news",
+                        country="RU",
                         include_published_date=True,
                         exclude_domains=promo_domains,
                     )
@@ -2638,6 +2665,7 @@ def _pick_draft_item(
                         max_results=8,
                         days=days_3,
                         topic="news",
+                        country="RU",
                         include_published_date=True,
                         exclude_domains=promo_domains,
                     )

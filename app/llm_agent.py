@@ -962,6 +962,7 @@ class LLMAgent:
         q_log = (query or "")[:400].replace("\n", " ")
         days_val = search_kwargs.get("days", "not_set")
         excluded_count = len(search_kwargs.get("exclude_domains") or [])
+        country_val = search_kwargs.get("country", "not_set")
 
         for attempt in range(1, total + 1):
             timeout_sec = self._tavily_timeout_for_attempt(attempt)
@@ -971,13 +972,15 @@ class LLMAgent:
                 else round(timeout_sec, 1)
             )
             logger.info(
-                "Tavily search: query=%r, timeout=%ss, attempt=%s/%s, days=%s, exclude_domains_count=%s",
+                "Tavily search: query=%r, timeout=%ss, attempt=%s/%s, days=%s, "
+                "exclude_domains_count=%s, country=%s",
                 q_log,
                 t_display,
                 attempt,
                 total,
                 days_val,
                 excluded_count,
+                country_val,
             )
             try:
                 result = self.tavily.search(
