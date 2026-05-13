@@ -186,6 +186,16 @@ def _log_openai_chat_completion_usage(response: object) -> None:
 # Множитель таймаута между попытками (лестница при базе из config, верхняя граница 120 с в SDK Tavily).
 _TAVILY_TIMEOUT_ATTEMPT_FACTOR = 1.5
 
+# Tavily ожидает полное название страны в нижнем регистре ("russia", "united states"),
+# а не ISO-коды ("RU", "US"). На случай если в коде где-то снова появится короткий код —
+# проактивно нормализуем перед вызовом API, чтобы не ловить 400 "Invalid country".
+_TAVILY_COUNTRY_ALIASES = {
+    "ru": "russia",
+    "rus": "russia",
+    "russian federation": "russia",
+    "россия": "russia",
+}
+
 # Подстроки в нормализованном тексте (ё→е): веб-поиск для актуальности / прогнозов / событий.
 SEARCH_TRIGGER_SUBSTRINGS = (
     "новости",
@@ -967,6 +977,32 @@ class LLMAgent:
         backoff_cap = 8.0
         q_log = (query or "")[:400].replace("\n", " ")
         base_kw = dict(search_kwargs)
+
+        raw_country = base_kw.get("country")
+        if isinstance(raw_country, str):
+            normalized_country = raw_country.strip().lower()
+            normalized_country = _TAVILY_COUNTRY_ALIASES.get(
+                normalized_country, normalized_country
+            )
+            if not normalized_country:
+                base_kw.pop("country", None)
+            elif normalized_country != raw_country:
+                logger.info(
+                    "Tavily: country normalized %r -> %r",
+                    raw_country,
+                    normalized_country,
+                )
+                base_kw["country"] = normalized_country
+            else:
+                base_kw["country"] = normalized_country
+        elif raw_country is not None:
+            logger.warning(
+                "Tavily: dropping non-string country=%r (type=%s)",
+                raw_country,
+                type(raw_country).__name__,
+            )
+            base_kw.pop("country", None)
+
         initial_country = base_kw.get("country")
 
         def _country_log_label(kw: dict[str, object]) -> str:
