@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import logging
 import random
 import re
@@ -19,7 +20,7 @@ from aiogram.exceptions import (
 )
 from aiohttp import ClientError
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, BufferedInputFile
 
 from app.admin import (
     NO_ADMIN_RIGHTS,
@@ -56,6 +57,9 @@ from app.content_editor import (
     detect_primary_category,
     estimate_feedback_quality_score,
     append_reject_hint,
+    apply_reject_reason_followup,
+    analyze_rejected_draft_with_gpt,
+    build_reject_reason_keyboard,
     extract_tg_channel_username_from_url,
     MAX_PENDING_UNAPPROVED_DRAFTS,
     MAX_SEARCH_WINDOW_DAYS,
@@ -72,6 +76,9 @@ from app.content_editor import (
     DRAFT_TOPIC_PICKER_INTRO,
     draft_dm_text,
     draft_topic_slug_to_query_prefix,
+    format_rejection_analysis_report,
+    format_learning_style_stats_block,
+    format_style_profile_message,
     build_editorial_rules_overlay,
     build_voice_examples_overlay,
     format_auto_interval_label,
@@ -94,6 +101,8 @@ from app.content_editor import (
     is_editor_enabled,
     is_draft_picker_failure_message,
     is_private_chat,
+    maybe_infer_editor_preference_from_voice,
+    maybe_add_negative_voice_on_rejection_pattern,
     maybe_distill_editorial_rules_sync,
     merge_sources_into_pref,
     merge_topics_into_pref,
@@ -102,6 +111,7 @@ from app.content_editor import (
     parse_auto_directive_from_rest,
     parse_deadline_directive_from_rest,
     parse_editor_callback,
+    parse_reject_reason_callback,
     remove_sources_from_pref,
     remove_topics_from_pref,
     parse_editor_extra_directives,
@@ -109,6 +119,8 @@ from app.content_editor import (
     pop_pending_feedback,
     pop_pending_learning,
     reset_editor_reject_state,
+    REJECT_REASON_SLUG_SKIP,
+    scan_pending_drafts_for_new_pattern,
     set_draft_status,
     set_pending_edit,
     set_pending_feedback,
@@ -133,12 +145,17 @@ from app.scenario_simulator import (
     run_scenario_expand,
 )
 from app.database import (
+    count_draft_feedback_for_draft,
     count_voice_training_examples,
+    export_style_profile_json,
     get_editorial_feedbacks_baseline,
     get_editorial_rules,
+    get_rejection_pattern_by_id,
     get_voice_training_examples,
+    import_style_profile_json,
     init_db,
     save_draft_feedback,
+    save_rejection_pattern,
     save_voice_training,
 )
 from app.health_check import (
@@ -374,6 +391,100 @@ def _schedule_ask_why(
     asyncio.create_task(
         _ask_why_after_action(bot, chat_id, user_id, draft_id, action, draft_body)
     )
+
+
+async def _send_reject_reason_prompt(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    draft_id: int,
+) -> None:
+    """После ❌ — кнопки с причиной отказа (без GPT-вопроса)."""
+    intro = (
+        "Почему отклоняешь? Выбери вариант — так я точнее подстрою подбор и качество "
+        "следующих черновиков 👇"
+    )
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=intro,
+            reply_markup=build_reject_reason_keyboard(draft_id),
+        )
+    except TelegramBadRequest as exc:
+        logger.warning("reject_reason_prompt: send failed user_id=%s: %s", user_id, exc)
+
+
+def _schedule_reject_reason_prompt(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    draft_id: int,
+) -> None:
+    asyncio.create_task(
+        _send_reject_reason_prompt(bot, chat_id, user_id, draft_id)
+    )
+
+
+async def _run_rejection_pattern_learning_task(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    draft_id: int,
+    reason_slug: str,
+    draft_body: str,
+    category: str | None,
+) -> None:
+    """GPT-разбор отклонённого черновика, сохранение паттерна, отчёт и проверка очереди."""
+    try:
+        analysis = await asyncio.to_thread(
+            analyze_rejected_draft_with_gpt,
+            agent,
+            draft_body,
+            reason_slug,
+        )
+        if not analysis:
+            await bot.send_message(
+                chat_id,
+                "✅ Причина сохранена. Не удалось разобрать черновик через GPT — "
+                "механические правила (источник, длина и т.д.) уже применены.",
+            )
+            return
+        pid = await asyncio.to_thread(
+            save_rejection_pattern,
+            user_id,
+            analysis,
+            category=category,
+        )
+        if pid:
+            row = await asyncio.to_thread(get_rejection_pattern_by_id, int(pid))
+            if row:
+                cnt = int(row.get("count") or 0)
+                await asyncio.to_thread(
+                    maybe_add_negative_voice_on_rejection_pattern,
+                    user_id,
+                    int(pid),
+                    draft_body,
+                    count_after_save=cnt,
+                )
+        report = format_rejection_analysis_report(reason_slug, analysis)
+        hits = await asyncio.to_thread(
+            scan_pending_drafts_for_new_pattern,
+            agent,
+            user_id,
+            draft_id,
+            analysis,
+        )
+        if hits:
+            report += (
+                "\n\n🔍 В очереди черновиков нашёл похожие по новому паттерну (id: "
+                + ", ".join(str(x) for x in hits)
+                + "). Загляни в /drafts — при необходимости удали лишнее."
+            )
+        if len(report) > 4000:
+            report = report[:3990] + "…"
+        await bot.send_message(chat_id, report)
+    except Exception as exc:
+        logger.exception("rejection_pattern_learning_task: %s", exc)
 
 
 def _expired_approve_keyboard(draft_id: int) -> InlineKeyboardMarkup:
@@ -707,7 +818,54 @@ async def learning_stats_cmd(message: Message) -> None:
     lines.append((demo or "Пока не удалось сгенерировать демо-текст. Попробуй ещё раз.").strip()[:700])
     lines.append("")
     lines.append("Напиши /learning чтобы добавить ещё пример")
-    await message.answer("\n".join(lines))
+    lines.append(format_learning_style_stats_block(uid))
+    text_out = "\n".join(lines)
+    if len(text_out) > 4000:
+        text_out = text_out[:3990] + "…"
+    await message.answer(text_out)
+
+
+@router.message(Command("style_profile"))
+async def style_profile_cmd(message: Message, bot: Bot) -> None:
+    if not message.from_user or message.from_user.id != LEARNING_OWNER_ID:
+        return
+    if not is_private_chat(message):
+        await message.answer("Команда доступна только в личке со мной.")
+        return
+    uid = message.from_user.id
+    parts = (message.text or "").split(maxsplit=1)
+    sub = (parts[1] if len(parts) > 1 else "").strip().lower()
+    if sub == "export":
+        data = await asyncio.to_thread(export_style_profile_json, uid)
+        raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        await message.answer_document(
+            BufferedInputFile(raw, filename=f"style_profile_{uid}.json"),
+            caption="Экспорт профиля стиля (voice + паттерны отказов)",
+        )
+        return
+    if sub == "import":
+        doc = message.document
+        if message.reply_to_message and message.reply_to_message.document:
+            doc = message.reply_to_message.document
+        if not doc or not str(doc.file_name or "").lower().endswith(".json"):
+            await message.answer(
+                "Прикрепи .json к сообщению с командой /style_profile import "
+                "или ответь этой командой на сообщение с файлом экспорта."
+            )
+            return
+        buf = BytesIO()
+        await bot.download(doc, destination=buf)
+        try:
+            payload = json.loads(buf.getvalue().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            await message.answer(f"Не удалось прочитать JSON: {exc}")
+            return
+        ok, msg = await asyncio.to_thread(import_style_profile_json, uid, payload)
+        await message.answer(msg if ok else f"❌ {msg}")
+        return
+    prefs = memory.get_style_preferences(uid)
+    body = format_style_profile_message(uid, prefs)
+    await message.answer(body)
 
 
 async def _editor_require_private(message: Message) -> bool:
@@ -2054,6 +2212,9 @@ async def text_handler(message: Message, bot: Bot) -> None:
             rid = save_voice_training(uid, pl, text.strip())
             pop_pending_learning(uid)
             if rid is not None:
+                asyncio.create_task(
+                    asyncio.to_thread(maybe_infer_editor_preference_from_voice, uid)
+                )
                 await message.answer("Записал твой стиль — учусь 📝")
             else:
                 await message.answer("Не удалось сохранить пример. Можешь отправить переписывание ещё раз.")
@@ -2076,6 +2237,7 @@ async def text_handler(message: Message, bot: Bot) -> None:
                 quality_score=(
                     int(pf["quality_score"]) if pf.get("quality_score") is not None else None
                 ),
+                reason=None,
             )
             pop_pending_feedback(uid)
             if rid is not None:
@@ -2588,6 +2750,66 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             "Окей, без комментария — запомнил как пропуск ✋ В другой раз расскажешь, если захочешь."
         )
         return
+    parsed_rej = parse_reject_reason_callback(data)
+    if parsed_rej is not None:
+        slug, did = parsed_rej
+        if not await _editor_require_private_message(
+            callback.message, acting_user_id=user_id
+        ):
+            return
+        if count_draft_feedback_for_draft(user_id, did) > 0:
+            await callback.message.answer(
+                "Уже записал ответ по этому черновику — если нужно что-то ещё, напиши текстом ✍️"
+            )
+            return
+        row = get_draft(user_id, did)
+        if not row or str(row.get("user_id") or "") != str(user_id):
+            await callback.message.answer(
+                "Черновик не найден или кнопка устарела — открой /drafts и свежий материал 🔎"
+            )
+            return
+        body = str(row.get("content") or "")
+        preview = body[:100].replace("\n", " ")
+        title = (body.splitlines()[0] if body else "").strip()
+        category = detect_primary_category(title, body[:400])
+        q_score = estimate_feedback_quality_score("rejected")
+        reason_kw = None if slug == REJECT_REASON_SLUG_SKIP else slug
+        rid = save_draft_feedback(
+            user_id,
+            did,
+            "rejected",
+            preview,
+            "",
+            category=category,
+            quality_score=q_score,
+            reason=reason_kw,
+        )
+        if rid is not None and slug != REJECT_REASON_SLUG_SKIP:
+            apply_reject_reason_followup(memory, user_id, slug, row)
+        if rid is not None:
+            asyncio.create_task(
+                asyncio.to_thread(maybe_distill_editorial_rules_sync, agent, user_id)
+            )
+        if rid is not None and reason_kw:
+            asyncio.create_task(
+                _run_rejection_pattern_learning_task(
+                    bot,
+                    callback.message.chat.id,
+                    user_id,
+                    did,
+                    slug,
+                    body,
+                    category,
+                )
+            )
+        await callback.message.answer(
+            "Записал причину — через пару секунд пришлю разбор черновика и паттерн 📎"
+            if rid and reason_kw
+            else "Записал причину — подстрою подбор под твои ответы 📎"
+            if rid
+            else "Не вышло сохранить в базу — попробуй нажать ещё раз или напиши одним сообщением ✍️"
+        )
+        return
     if data == LEARNING_SKIP:
         if user_id != LEARNING_OWNER_ID:
             return
@@ -2900,7 +3122,7 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             await callback.message.answer(
                 "Записал отказ в мою «чёрную маленькую тетрадь» подбора — в следующий раз уйду чуть в сторону 📝❌"
             )
-            _schedule_ask_why(bot, callback.message.chat.id, user_id, did, "rejected", body)
+            _schedule_reject_reason_prompt(bot, callback.message.chat.id, user_id, did)
             return
         if act == "x":
             set_draft_status(user_id, did, "rejected")

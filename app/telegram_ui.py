@@ -57,6 +57,7 @@ def build_admin_bot_commands() -> list[BotCommand]:
     return build_user_bot_commands() + [
         BotCommand(command="learning", description="[Владелец] Режим обучения голосу"),
         BotCommand(command="learning_stats", description="[Владелец] Статистика обучения"),
+        BotCommand(command="style_profile", description="[Владелец] Профиль стиля / export / import"),
         BotCommand(command="stats", description="[Админ] Статистика бота"),
         BotCommand(command="admin", description="[Админ] Панель администратора"),
         BotCommand(command="selftest", description="[Админ] Самодиагностика (функции)"),

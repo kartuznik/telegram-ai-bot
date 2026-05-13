@@ -14,17 +14,35 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.config import Config
 from app.database import (
+    bump_pattern_usage,
     get_connection,
+    get_active_rejection_patterns,
     get_draft_feedback_rejected_approved_counts,
     get_draft_feedback_slice,
     get_editorial_feedbacks_baseline,
     get_editorial_rules,
     get_feedbacks_count,
     get_feedback_category_counts_in_window,
+    get_feedback_hard_reject_category_counts_in_window,
     get_recent_draft_feedback_window,
     get_recent_expired_urls,
     get_voice_training_examples,
+    get_voice_negative_training_examples,
+    count_voice_negative_training_examples,
+    count_voice_training_examples,
+    count_draft_posts_by_status,
+    count_draft_posts_total,
+    count_posted_drafts_unedited,
+    count_user_rejection_patterns,
+    count_draft_feedback_by_action,
+    get_recent_voice_training_pairs,
+    list_all_rejection_patterns,
+    get_feedback_rejected_category_counts_in_window,
+    list_user_drafts_by_status,
     save_editorial_rules,
+    save_rejection_pattern,
+    save_voice_training,
+    get_rejection_pattern_by_id,
 )
 from app.llm_agent import LLMAgent
 from app.memory import ChatMemory
@@ -71,9 +89,24 @@ PREF_HOST_REJECT_COUNTS = "content_editor_reject_host_counts"
 PREF_DRAFT_DEADLINE_HOURS = "content_editor_draft_deadline_hours"
 PREF_SEARCH_WINDOW_DAYS = "content_editor_search_window_days"
 PREF_PICK_FAIL_STREAK = "content_editor_pick_fail_streak"
+PREF_QUALITY_MIN_LEN_SLACK = "content_editor_quality_min_len_slack"
+PREF_PROMO_BLOCKED_HOSTS = "content_editor_promo_blocked_hosts"
 
 # Inline «выбор темы», если автопоиск не нашёл черновик
 CALLBACK_DRAFT_TOPIC_PREFIX = "draft_topic"
+
+# Причина отказа после ❌ (callback_data fbrej:<slug>:<draft_id>)
+CALLBACK_REJECT_REASON_PREFIX = "fbrej"
+REJECT_REASON_SLUG_SKIP = "skip"
+REJECT_REASON_SLUGS = frozenset(
+    {
+        "not_interested",
+        "weak_content",
+        "bad_source",
+        "promotional",
+        REJECT_REASON_SLUG_SKIP,
+    }
+)
 
 DRAFT_TOPIC_PICKER_INTRO = (
     "Не нашёл подходящих черновиков. Выбери тему для поиска:\n\n"
@@ -719,6 +752,316 @@ def build_editorial_rules_overlay(user_id: int) -> str:
     )
 
 
+_MAX_STYLE_REJECTION_OVERLAY_CHARS = 3600
+
+_PREF_LONG_MARKER = "Предпочитает развёрнутые материалы"
+_PREF_SHORT_MARKER = "Предпочитает лаконичные посты"
+_PREF_HEADERS_MARKER = "Предпочитает явную структуру с подзаголовками"
+
+
+def patterns_for_rejection_gate(patterns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Паттерны для отсева кандидатов: без «положительных» editor_preference."""
+    out: list[dict[str, Any]] = []
+    for p in patterns:
+        pt = str(p.get("pattern_type") or "").strip().lower()
+        if pt == "editor_preference":
+            continue
+        out.append(p)
+    return out
+
+
+def build_editor_style_rejection_overlay(user_id: int, *, limit: int = 10) -> str:
+    """
+    Блок для system prompt: что нравится / не нравится по паттернам отказов
+    и негативным примерам voice_training.
+    """
+    uid = str(user_id)
+    rows = get_active_rejection_patterns(uid, limit=max(6, min(int(limit), 16)))
+    prefer: list[dict[str, Any]] = []
+    avoid: list[dict[str, Any]] = []
+    for r in rows:
+        pt = str(r.get("pattern_type") or "").strip().lower()
+        if pt == "editor_preference":
+            prefer.append(r)
+        else:
+            avoid.append(r)
+    neg_voice = get_voice_negative_training_examples(uid, limit=2)
+    lines: list[str] = [
+        "\nСТИЛЬ РЕДАКТОРА (профиль канала — учитывай при генерации черновика):\n",
+    ]
+    if prefer:
+        lines.append("✅ Что нравится (на основе одобренных постов и явных предпочтений):\n")
+        for p in prefer[:6]:
+            d = str(p.get("pattern_description") or "").strip()
+            if d:
+                w = p.get("pattern_weight")
+                extra = f" (вес {float(w):.1f})" if w is not None else ""
+                lines.append(f"• {d[:700]}{extra}\n")
+    if avoid:
+        lines.append("\n❌ Что НЕ нравится (на основе отклонённых постов и паттернов отказов):\n")
+        for p in avoid[:8]:
+            d = str(p.get("pattern_description") or "").strip()
+            if d:
+                w = p.get("pattern_weight")
+                extra = f" — вес {float(w):.1f}" if w is not None else ""
+                lines.append(f"• {d[:700]}{extra}\n")
+    if neg_voice:
+        lines.append("\nПРИМЕРЫ «как не надо» (из отклонённых черновиков):\n")
+        for nv in neg_voice[:3]:
+            lines.append(f"— {nv[:900]}\n")
+    if len(prefer) + len(avoid) == 0 and not neg_voice:
+        return ""
+    lines.append(
+        "\nПри генерации нового черновика: следуй стилю одобренных постов (см. примеры выше в промпте) "
+        "и ИЗБЕГАЙ формулировок и приёмов из списка «не нравится» и негативных примеров.\n"
+    )
+    block = "".join(lines).strip()
+    if len(block) > _MAX_STYLE_REJECTION_OVERLAY_CHARS:
+        block = block[: _MAX_STYLE_REJECTION_OVERLAY_CHARS - 1] + "…"
+    return block + "\n" if block else ""
+
+
+def maybe_add_negative_voice_on_rejection_pattern(
+    user_id: int,
+    pattern_id: int,
+    rejected_draft_body: str,
+    *,
+    count_after_save: int,
+) -> None:
+    """После 3-го срабатывания одного паттерна отказа — негативный пример для контрастного обучения."""
+    if count_after_save != 3:
+        return
+    row = get_rejection_pattern_by_id(int(pattern_id))
+    if not row:
+        return
+    desc = str(row.get("pattern_description") or "").strip()
+    if not desc:
+        return
+    draft_snip = (rejected_draft_body or "").strip()[:3500]
+    if len(draft_snip) < 30:
+        return
+    instruction = (
+        f"НЕ пиши так (фрагмент отклонённого черновика):\n{draft_snip}\n\n"
+        f"Потому что: {desc[:1200]}"
+    )
+    save_voice_training(
+        str(user_id),
+        f"отказ: паттерн #{pattern_id}",
+        instruction,
+        is_negative=True,
+    )
+
+
+def maybe_infer_editor_preference_from_voice(user_id: int) -> None:
+    """
+    Если пользователь стабильно переписывает тексты в одну сторону (длина / структура),
+    фиксируем это как pattern_type=editor_preference (не участвует в отсеве кандидатов, только в промпте).
+    """
+    uid = str(user_id)
+    pairs = get_recent_voice_training_pairs(uid, limit=20)
+    if len(pairs) < 5:
+        return
+    existing = list_all_rejection_patterns(uid)
+    existing_desc = " ".join(str(p.get("pattern_description") or "") for p in existing)
+
+    def _has(marker: str) -> bool:
+        return marker in existing_desc
+
+    longer = 0
+    shorter = 0
+    more_headers = 0
+    for orig, rew in pairs:
+        lo, lr = len(orig), len(rew)
+        if lr >= lo + 180 and lr >= 420:
+            longer += 1
+        elif lo >= 160 and lr > 40 and lr <= int(lo * 0.72):
+            shorter += 1
+        oh = orig.count("\n##") + orig.count("\n###")
+        rh = rew.count("\n##") + rew.count("\n###")
+        if rh >= max(oh + 1, 2):
+            more_headers += 1
+
+    if longer >= 5 and not _has(_PREF_LONG_MARKER):
+        save_rejection_pattern(
+            uid,
+            {
+                "pattern_type": "editor_preference",
+                "pattern_description": (
+                    f"{_PREF_LONG_MARKER}: больше контекста, деталей и абзацев, "
+                    "а не короткие сводки без конкретики."
+                ),
+                "problems": [],
+                "requirements": ["Достаточная глубина, факты и несколько связных абзацев."],
+                "keywords_to_avoid": [],
+            },
+            category=None,
+        )
+    if shorter >= 5 and not _has(_PREF_SHORT_MARKER):
+        save_rejection_pattern(
+            uid,
+            {
+                "pattern_type": "editor_preference",
+                "pattern_description": (
+                    f"{_PREF_SHORT_MARKER}: убирать воду, оставлять ядро сообщения."
+                ),
+                "problems": [],
+                "requirements": ["Сжатая подача без лишних повторов."],
+                "keywords_to_avoid": [],
+            },
+            category=None,
+        )
+    if more_headers >= 5 and not _has(_PREF_HEADERS_MARKER):
+        save_rejection_pattern(
+            uid,
+            {
+                "pattern_type": "editor_preference",
+                "pattern_description": (
+                    f"{_PREF_HEADERS_MARKER} (Markdown ##), чтобы текст был проще сканировать."
+                ),
+                "problems": [],
+                "requirements": ["Логичные подзаголовки по смыслу блоков."],
+                "keywords_to_avoid": [],
+            },
+            category=None,
+        )
+
+
+def _top_keys_from_counts(d: dict[str, int], *, n: int = 2) -> list[str]:
+    if not d:
+        return []
+    items = sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [k for k, _ in items[:n] if k and k != "other"]
+
+
+def format_learning_style_stats_block(user_id: int) -> str:
+    """Расширение /learning_stats: анти-предпочтения, паттерны, сводные цифры."""
+    uid = str(user_id)
+    win = 80
+    patterns = get_active_rejection_patterns(uid, limit=8)
+    prefer = [p for p in patterns if str(p.get("pattern_type") or "").lower() == "editor_preference"]
+    avoid = [p for p in patterns if str(p.get("pattern_type") or "").lower() != "editor_preference"]
+    neg_n = count_voice_negative_training_examples(uid)
+    appr = count_draft_feedback_by_action(uid, "approved")
+    rej = count_draft_feedback_by_action(uid, "rejected")
+    p_total = count_user_rejection_patterns(uid)
+    voice_total = count_voice_training_examples(uid)
+    lines: list[str] = ["", "📊 ТВОЙ РЕДАКТОРСКИЙ СТИЛЬ:", ""]
+    if prefer:
+        lines.append("✅ Предпочтения (в т.ч. из переписываний):")
+        for p in prefer[:5]:
+            d = str(p.get("pattern_description") or "").strip()
+            if d:
+                lines.append(f"• {d[:420]}")
+        lines.append("")
+    if avoid:
+        lines.append("❌ Анти-предпочтения (из отклонённых):")
+        for p in avoid[:6]:
+            d = str(p.get("pattern_description") or "").strip()
+            c = int(p.get("count") or 0)
+            if d:
+                lines.append(f"• {d[:420]} (×{c})")
+        lines.append("")
+    lines.append("📈 Статистика:")
+    lines.append(f"• Позитивных примеров голоса: {voice_total}")
+    lines.append(f"• Негативных примеров (отказы): {neg_n}")
+    lines.append(f"• Одобрено (feedback): {appr} / отклонено: {rej}")
+    lines.append(f"• Паттернов отказов в базе: {p_total}")
+    if appr + rej > 0:
+        lines.append(f"• Доля одобрений: {100 * appr // (appr + rej)}% (по последним решениям в ленте feedback)")
+    lines.append("")
+    lines.append("🎯 Активные паттерны (по весу свежести):")
+    for i, p in enumerate(patterns[:6], start=1):
+        d = str(p.get("pattern_description") or "").strip()[:200]
+        c = int(p.get("count") or 0)
+        w = p.get("pattern_weight")
+        ws = f", вес {float(w):.1f}" if w is not None else ""
+        if d:
+            lines.append(f"{i}. {d} — ×{c}{ws}")
+    cat_ok = get_feedback_category_counts_in_window(uid, min(win, 120))
+    cat_bad = get_feedback_rejected_category_counts_in_window(uid, min(win, 120))
+    top_ok = _top_keys_from_counts(cat_ok, n=1)
+    top_bad = _top_keys_from_counts(cat_bad, n=1)
+    if top_ok or top_bad:
+        lines.append("")
+        lines.append("📌 Тренды (по последним записям draft_feedback):")
+        if top_ok:
+            lines.append(f"• Чаще разбираешь категории: {', '.join(top_ok)}")
+        if top_bad:
+            lines.append(f"• Чаще отклоняешь (по категории): {', '.join(top_bad)}")
+    return "\n".join(lines).strip()
+
+
+def format_style_profile_message(user_id: int, prefs: dict[str, str] | None) -> str:
+    """Текст команды /style_profile — полный редакторский профиль."""
+    uid = str(user_id)
+    topics = (prefs or {}).get(PREF_TOPICS) if prefs else None
+    topics_line = (topics or "").strip()[:200] or "—"
+    patterns = get_active_rejection_patterns(uid, limit=12)
+    prefer = [p for p in patterns if str(p.get("pattern_type") or "").lower() == "editor_preference"]
+    avoid = [p for p in patterns if str(p.get("pattern_type") or "").lower() != "editor_preference"]
+    st = count_draft_posts_by_status(uid)
+    n_total = count_draft_posts_total(uid)
+    n_posted = int(st.get("posted") or 0)
+    n_draft = int(st.get("draft") or 0)
+    n_rejected = int(st.get("rejected") or 0)
+    appr_fb = count_draft_feedback_by_action(uid, "approved")
+    rej_fb = count_draft_feedback_by_action(uid, "rejected")
+    voice_pos = count_voice_training_examples(uid)
+    neg_n = count_voice_negative_training_examples(uid)
+    p_n = count_user_rejection_patterns(uid)
+    posted_clean = count_posted_drafts_unedited(uid)
+    acc = int(100 * posted_clean / n_posted) if n_posted > 0 else None
+    acc2 = int(100 * appr_fb / (appr_fb + rej_fb)) if appr_fb + rej_fb > 0 else None
+    lines: list[str] = [
+        "🎨 ТВОЙ РЕДАКТОРСКИЙ ПРОФИЛЬ",
+        "",
+        "📌 Основные принципы:",
+    ]
+    if prefer:
+        lines.append("✅ Пиши: " + "; ".join(str(p.get("pattern_description") or "").strip()[:160] for p in prefer[:4] if str(p.get("pattern_description") or "").strip()))
+    else:
+        lines.append("✅ Пиши: (пока нет явных «плюсовых» паттернов — добавь /learning или одобряй черновики)")
+    if avoid:
+        lines.append("❌ Избегай: " + "; ".join(str(p.get("pattern_description") or "").strip()[:160] for p in avoid[:5] if str(p.get("pattern_description") or "").strip()))
+    else:
+        lines.append("❌ Избегай: (паттерны отказов появятся после отклонений с уточнением причины)")
+    lines.extend(
+        [
+            "",
+            "📊 Статистика:",
+            f"• Всего черновиков в базе: {n_total} (черновик в очереди: {n_draft}, опубликовано: {n_posted}, отклонено статусом: {n_rejected})",
+            f"• Feedback: одобрено {appr_fb}, отклонено {rej_fb}",
+            f"• Обучение голоса: позитивных примеров {voice_pos}, негативных {neg_n}, паттернов отказов {p_n}",
+            f"• Темы в настройках: {topics_line}",
+            "",
+        ]
+    )
+    if acc is not None:
+        lines.append(
+            f"🎯 Точность «с первого раза» (опубликовано без правки was_edited): {acc}% "
+            f"({posted_clean}/{n_posted})"
+        )
+    if acc2 is not None:
+        lines.append(f"🎯 Доля одобрений по кнопкам: {acc2}%")
+    lines.append("")
+    lines.append("🎯 Активные паттерны:")
+    for i, p in enumerate(patterns[:8], start=1):
+        d = str(p.get("pattern_description") or "").strip()[:220]
+        c = int(p.get("count") or 0)
+        if d:
+            lines.append(f"{i}. {d} — встречался ×{c}")
+    lines.append("")
+    lines.append("💡 Рекомендации:")
+    lines.append("• Экспорт профиля: /style_profile export")
+    lines.append("• Импорт: ответь файлом .json на сообщение бота с командой /style_profile import")
+    if topics_line not in ("—", ""):
+        lines.append(f"• Текущие темы можно сузить/расширить: /editor_prefs (сейчас: {topics_line[:120]})")
+    out = "\n".join(lines)
+    if len(out) > 4000:
+        out = out[:3990] + "…"
+    return out
+
+
 def format_editor_info_text(prefs: dict[str, str], *, user_id: int | None = None) -> str:
     """Текст для /editor_info — сводка prefs редактора."""
     sm = get_source_mode(prefs)
@@ -836,6 +1179,89 @@ def _bump_host_reject_count(memory: ChatMemory, user_id: int, host: str) -> None
         )
 
 
+def _max_promo_blocklist_entries() -> int:
+    return 40
+
+
+def _load_promo_blocklist_keys(prefs: dict[str, str]) -> frozenset[str]:
+    raw = (prefs.get(PREF_PROMO_BLOCKED_HOSTS) or "").strip()
+    if not raw:
+        return frozenset()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return frozenset()
+    if not isinstance(data, list):
+        return frozenset()
+    out: set[str] = set()
+    for x in data:
+        k = str(x).strip().lower()
+        if k:
+            out.add(k[:120])
+    return frozenset(out)
+
+
+def _promo_blocklist_key_for_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    h = _host(u).split(":")[0].lower().lstrip("www.")
+    if not h:
+        return ""
+    if h in ("t.me", "telegram.me", "telegram.dog"):
+        ch = extract_tg_channel_username_from_url(u)
+        return f"tg:{ch}" if ch else f"host:{h}"
+    return f"host:{h}"
+
+
+def url_matches_user_promo_blocklist(url: str, keys: frozenset[str]) -> bool:
+    """Совпадение URL с пользовательским списком после отказа «рекламный пост»."""
+    if not keys or not (url or "").strip():
+        return False
+    h = _host(url).split(":")[0].lower().lstrip("www.")
+    ch = extract_tg_channel_username_from_url(url)
+    for k in keys:
+        if k.startswith("tg:"):
+            if ch and k == f"tg:{ch}":
+                return True
+        elif k.startswith("host:"):
+            dom = k[5:].strip().lower()
+            if not dom:
+                continue
+            if h == dom or (h.endswith(f".{dom}") and len(h) > len(dom)):
+                return True
+    return False
+
+
+def append_promo_blocklist_from_url(memory: ChatMemory, user_id: int, url: str) -> None:
+    key = _promo_blocklist_key_for_url(url)
+    if not key or key == "tg:":
+        return
+    prefs = _prefs(memory, user_id)
+    raw = (prefs.get(PREF_PROMO_BLOCKED_HOSTS) or "").strip()
+    try:
+        cur_l: list[Any] = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        cur_l = []
+    if not isinstance(cur_l, list):
+        cur_l = []
+    norm = [str(x).strip().lower()[:120] for x in cur_l if str(x).strip()]
+    if key not in norm:
+        norm.append(key)
+    cap = _max_promo_blocklist_entries()
+    norm = norm[-cap:]
+    memory.update_style_preferences(
+        user_id,
+        {PREF_PROMO_BLOCKED_HOSTS: json.dumps(norm, ensure_ascii=False)},
+    )
+    logger.info(
+        "promo_blocklist: user_id=%s added=%r size=%s",
+        user_id,
+        key,
+        len(norm),
+    )
+
+
 def _norm_cmp_url(url: str) -> str:
     u = (url or "").strip().lower()
     try:
@@ -936,9 +1362,11 @@ def _is_duplicate_by_title(title: str, user_id: int) -> bool:
     return False
 
 
-def _assess_draft_quality(draft_text: str) -> tuple[bool, str]:
+def _assess_draft_quality(draft_text: str, *, min_len_slack: int = 0) -> tuple[bool, str]:
     text = (draft_text or "").strip()
-    if len(text) < 100:
+    slack = max(0, min(60, int(min_len_slack)))
+    min_len = max(40, 100 - slack)
+    if len(text) < min_len:
         return False, "too_short"
     if not re.search(r"\d", text):
         return False, "no_numbers_or_dates"
@@ -1252,8 +1680,10 @@ def maybe_distill_editorial_rules_sync(agent: LLMAgent, user_id: int) -> None:
         act = str(r.get("action") or "").strip().lower()
         prev = str(r.get("draft_preview") or "").replace("\n", " ").strip()
         fb = str(r.get("feedback_text") or "").replace("\n", " ").strip()
+        rs = str(r.get("reason") or "").strip()
+        rs_part = f" Причина отказа: {rs}." if rs and act == "rejected" else ""
         line = (
-            f"Действие: {act}. Фрагмент черновика: {prev[:180]}. Комментарий: {fb[:600]}"
+            f"Действие: {act}. Фрагмент черновика: {prev[:180]}.{rs_part} Комментарий: {fb[:600]}"
         )
         if act == "expired_content":
             expired_lines.append(line)
@@ -1370,6 +1800,59 @@ def build_editor_keyboard(draft_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="👁 Уже видел",
                     callback_data=f"editor:{CB_SEEN}:{draft_id}",
+                ),
+            ],
+        ],
+    )
+
+
+def parse_reject_reason_callback(data: str) -> tuple[str, int] | None:
+    """fbrej:<slug>:<draft_id> → (slug, draft_id) или None."""
+    parts = (data or "").split(":")
+    if len(parts) != 3 or parts[0] != CALLBACK_REJECT_REASON_PREFIX:
+        return None
+    slug, sid = parts[1], parts[2]
+    if slug not in REJECT_REASON_SLUGS:
+        return None
+    try:
+        return slug, int(sid)
+    except ValueError:
+        return None
+
+
+def build_reject_reason_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+    did = int(draft_id)
+    p = CALLBACK_REJECT_REASON_PREFIX
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="😐 Не интересно",
+                    callback_data=f"{p}:not_interested:{did}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📉 Слабый контент",
+                    callback_data=f"{p}:weak_content:{did}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📰 Источник не нравится",
+                    callback_data=f"{p}:bad_source:{did}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📢 Рекламный пост",
+                    callback_data=f"{p}:promotional:{did}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🤐 Не хочу уточнять",
+                    callback_data=f"{p}:{REJECT_REASON_SLUG_SKIP}:{did}",
                 ),
             ],
         ]
@@ -1817,17 +2300,100 @@ def estimate_feedback_quality_score(action: str) -> int:
     return 5
 
 
-def _feedback_signal_from_row(action: str, quality_score: int | None) -> float:
+def quality_min_len_slack_from_prefs(prefs: dict[str, str]) -> int:
+    try:
+        return max(0, min(60, int(float((prefs.get(PREF_QUALITY_MIN_LEN_SLACK) or "0").strip() or 0))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_weak_content_quality_slack(memory: ChatMemory, user_id: int) -> None:
+    """После отказа «слабый контент» — чуть снизить порог минимальной длины черновика."""
+    prefs = _prefs(memory, user_id)
+    cur = quality_min_len_slack_from_prefs(prefs)
+    nxt = min(60, cur + 20)
+    if nxt != cur:
+        memory.update_style_preferences(user_id, {PREF_QUALITY_MIN_LEN_SLACK: str(nxt)})
+        logger.info(
+            "reject_reason weak_content: user_id=%s quality_min_len_slack %s→%s",
+            user_id,
+            cur,
+            nxt,
+        )
+
+
+def apply_reject_reason_followup(
+    memory: ChatMemory,
+    user_id: int,
+    reason_slug: str,
+    draft_row: dict[str, Any],
+) -> None:
+    """Доп. действия по выбранной причине отказа (источник / порог длины / реклама)."""
+    slug = (reason_slug or "").strip().lower()
+    if slug == "weak_content":
+        bump_weak_content_quality_slack(memory, user_id)
+        return
+    u = str(draft_row.get("source_url") or "").strip()
+    if not u:
+        return
+    host = _host(u).split(":")[0].lower().lstrip("www.")
+    if slug == "bad_source":
+        if not host:
+            return
+        for _i in range(3):
+            _bump_host_reject_count(memory, user_id, host)
+        logger.info(
+            "reject_reason bad_source: user_id=%s extra_host_bumps=3 host=%r",
+            user_id,
+            host[:120],
+        )
+        return
+    if slug == "promotional":
+        if host:
+            for _i in range(5):
+                _bump_host_reject_count(memory, user_id, host)
+        append_promo_blocklist_from_url(memory, user_id, u)
+        logger.info(
+            "reject_reason promotional: user_id=%s host_bumps=5 host=%r",
+            user_id,
+            host[:120],
+        )
+        return
+
+
+def _reject_category_signal_multiplier(reject_reason: str | None) -> float:
+    """Вес отказа для preference[категория]: слабый контент/источник — не про тему; реклама — умеренный штраф."""
+    r = (reject_reason or "").strip().lower()
+    if r == "weak_content":
+        return 0.5
+    if r == "bad_source":
+        return 0.35
+    if r == "promotional":
+        return 0.8
+    if r == "already_seen":
+        return 0.45
+    return 1.0
+
+
+def _feedback_signal_from_row(
+    action: str,
+    quality_score: int | None,
+    reject_reason: str | None = None,
+) -> float:
     """Перевод feedback в сигнал -1..1 для preference."""
     act_l = (action or "").strip().lower()
     if act_l == "rejected":
         # Один отказ ≈ -0.3; несколько отказов в окне усиливают негатив через среднее по категории.
         base_r = -0.3
         if quality_score is None:
-            return base_r
-        q = max(1, min(10, int(quality_score)))
-        q_centered = (q - 5.5) / 4.5
-        return max(-0.87, min(0.0, 0.82 * base_r + 0.18 * q_centered))
+            sig = base_r
+        else:
+            q = max(1, min(10, int(quality_score)))
+            q_centered = (q - 5.5) / 4.5
+            sig = max(-0.87, min(0.0, 0.82 * base_r + 0.18 * q_centered))
+        mult = _reject_category_signal_multiplier(reject_reason)
+        out = sig * mult
+        return max(-0.87, min(0.0, out))
     base = {
         "approved": 0.4,
         "edited": 0.35,
@@ -1860,9 +2426,12 @@ def category_preferences_for_user(
     for i, r in enumerate(rows):
         category = (str(r.get("category") or "").strip().lower() or "other")[:64]
         weight = decay**i
+        reason_raw = str(r.get("reason") or "").strip().lower() or None
+        act_raw = str(r.get("action") or "").strip().lower()
         signal = _feedback_signal_from_row(
-            str(r.get("action") or ""),
+            act_raw,
             int(r["quality_score"]) if r.get("quality_score") is not None else None,
+            reason_raw if act_raw == "rejected" else None,
         )
         num[category] = num.get(category, 0.0) + signal * weight
         den[category] = den.get(category, 0.0) + weight
@@ -2406,6 +2975,246 @@ def verify_topic_relevance(agent: LLMAgent, text: str, topic: str) -> bool:
     return True
 
 
+def _parse_gpt_json_object(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    if "```" in s:
+        parts = s.split("```")
+        for chunk in parts:
+            c = chunk.strip()
+            if c.lower().startswith("json"):
+                c = c[4:].strip()
+            if c.startswith("{") and "}" in c:
+                s = c
+                break
+    i = s.find("{")
+    j = s.rfind("}")
+    if i == -1 or j == -1 or j <= i:
+        return None
+    try:
+        out = json.loads(s[i : j + 1])
+    except json.JSONDecodeError:
+        return None
+    return out if isinstance(out, dict) else None
+
+
+_REJECTION_ANALYSIS_SYSTEM = (
+    "Ты редактор новостного канала. Проанализируй отклонённый черновик и верни ТОЛЬКО один JSON-объект "
+    "без пояснений и без markdown. Ключи строго: problems (массив строк), pattern_description (строка), "
+    "pattern_type (строка: weak_content|promotional|bad_source|not_interested|unknown), "
+    "keywords_to_avoid (массив строк или []), requirements (массив строк)."
+)
+
+
+def analyze_rejected_draft_with_gpt(
+    agent: LLMAgent,
+    draft_content: str,
+    reason: str | None,
+) -> dict[str, Any] | None:
+    """Смысловой разбор отклонённого черновика для обучения паттернам."""
+    body = (draft_content or "").strip()
+    if len(body) < 20:
+        return None
+    body = body[:6000]
+    reason_s = (reason or "").strip().lower() or "не указана"
+    user_block = (
+        f"Текст черновика:\n{body}\n\n"
+        f"Причина отказа (кнопка пользователя): {reason_s}\n\n"
+        "Найди конкретные проблемы:\n"
+        "1. Структура: короткие/длинные предложения, абзацы\n"
+        "2. Содержание: есть ли имена, даты, цифры, факты\n"
+        "3. Стиль: эмоциональный/сухой, активные/пассивные глаголы\n"
+        "4. Слова-маркеры рекламы: «купить», «акция», «бесплатно» и т.п.\n"
+        "5. Тональность: позитив / негатив / нейтрально\n\n"
+        "Верни JSON по схеме из системного сообщения."
+    )
+    try:
+        raw = agent.run_raw_completion(
+            system=_REJECTION_ANALYSIS_SYSTEM,
+            user=user_block,
+            max_tokens=900,
+            temperature=0.2,
+        )
+    except Exception as exc:
+        logger.warning("analyze_rejected_draft_with_gpt: GPT error: %s", exc)
+        return None
+    data = _parse_gpt_json_object(raw)
+    if not data:
+        logger.warning("analyze_rejected_draft_with_gpt: не удалось разобрать JSON")
+        return None
+    if not isinstance(data.get("problems"), list):
+        data["problems"] = []
+    if not isinstance(data.get("requirements"), list):
+        data["requirements"] = []
+    if not isinstance(data.get("keywords_to_avoid"), list):
+        data["keywords_to_avoid"] = []
+    pt = str(data.get("pattern_type") or "unknown").strip().lower()
+    if pt not in ("weak_content", "promotional", "bad_source", "not_interested", "unknown"):
+        data["pattern_type"] = "unknown"
+    return data
+
+
+_REJECTION_CANDIDATE_CHECK_SYSTEM = (
+    "Ты редактор. Сравни кандидат новости с паттернами отказов пользователя. "
+    "Ответь ТОЛЬКО JSON без markdown: "
+    '{"is_similar_to_rejected": false, "violated_pattern_id": null, "can_be_fixed": false, "fixed_version": null}. '
+    "violated_pattern_id — целое id из списка паттернов или null. "
+    "fixed_version — только если can_be_fixed true: краткий исправленный текст (заголовок + 1–3 абзаца) на русском, иначе null."
+)
+
+
+def check_candidate_against_rejection_patterns(
+    agent: LLMAgent,
+    title: str,
+    snippet: str,
+    patterns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """GPT: похож ли кандидат (заголовок+сниппет) на ранее отклонённые паттерны."""
+    out: dict[str, Any] = {
+        "is_similar_to_rejected": False,
+        "violated_pattern_id": None,
+        "can_be_fixed": False,
+        "fixed_version": None,
+    }
+    if not patterns:
+        return out
+    cand = f"{(title or '').strip()}\n\n{(snippet or '').strip()}"[:4500]
+    lines: list[str] = []
+    for p in patterns:
+        pid = p.get("id")
+        desc = (str(p.get("pattern_description") or "")).strip()
+        ptype = (str(p.get("pattern_type") or "")).strip()
+        if not desc:
+            continue
+        lines.append(f"id={pid} type={ptype}: {desc[:900]}")
+    if not lines:
+        return out
+    user_block = (
+        "Текст кандидата (заголовок и сниппет):\n"
+        f"{cand}\n\n"
+        "Паттерны отказов пользователя:\n"
+        + "\n".join(lines)
+        + "\n\n"
+        "Вопросы: (1) Похож ли пост на те, что отклонялись? (2) Какой id паттерна? "
+        "(3) Можно ли исправить текст кандидата без смены темы? (4) Если да — дай fixed_version.\n"
+        "Верни JSON строго по схеме из системного сообщения."
+    )
+    try:
+        raw = agent.run_raw_completion(
+            system=_REJECTION_CANDIDATE_CHECK_SYSTEM,
+            user=user_block,
+            max_tokens=700,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        logger.warning("check_candidate_against_rejection_patterns: GPT error: %s", exc)
+        return out
+    data = _parse_gpt_json_object(raw)
+    if not data:
+        return out
+    out["is_similar_to_rejected"] = bool(data.get("is_similar_to_rejected"))
+    vid = data.get("violated_pattern_id")
+    if vid is not None:
+        try:
+            out["violated_pattern_id"] = int(vid)
+        except (TypeError, ValueError):
+            out["violated_pattern_id"] = None
+    out["can_be_fixed"] = bool(data.get("can_be_fixed"))
+    fx = data.get("fixed_version")
+    if isinstance(fx, str) and fx.strip():
+        out["fixed_version"] = fx.strip()[:4000]
+    return out
+
+
+def format_rejection_analysis_report(reason_slug: str, analysis: dict[str, Any]) -> str:
+    """Телеграм-отчёт после GPT-анализа отказа."""
+    labels = {
+        "not_interested": "Не интересно",
+        "weak_content": "Слабый контент",
+        "bad_source": "Источник не нравится",
+        "promotional": "Рекламный пост",
+        "editor_preference": "Предпочтение редактора",
+        "skip": "Без уточнения",
+    }
+    reason_h = labels.get((reason_slug or "").strip().lower(), reason_slug or "—")
+    problems = analysis.get("problems") or []
+    if not isinstance(problems, list):
+        problems = []
+    prob_lines = "\n".join(f"❌ {str(p).strip()}" for p in problems[:8] if str(p).strip())
+    if not prob_lines:
+        prob_lines = "❌ (модель не выделила отдельные пункты)"
+    desc = str(analysis.get("pattern_description") or "").strip() or "—"
+    req = analysis.get("requirements") or []
+    if not isinstance(req, list):
+        req = []
+    req_lines = "\n".join(f"✅ {str(r).strip()}" for r in req[:8] if str(r).strip())
+    if not req_lines:
+        req_lines = "✅ (без явных требований)"
+    return (
+        f"✅ Записал причину: {reason_h}\n\n"
+        f"📊 Проанализировал пост:\n{prob_lines}\n\n"
+        f"🧠 Запомнил паттерн: «{desc[:500]}»\n\n"
+        f"📋 В следующий раз буду искать:\n{req_lines}"
+    )
+
+
+def check_pending_draft_against_new_pattern(
+    agent: LLMAgent,
+    draft_body: str,
+    pattern_description: str,
+    pattern_type: str,
+) -> bool:
+    """Быстрая проверка: похож ли уже готовый черновик на только что извлечённый паттерн."""
+    desc = (pattern_description or "").strip()[:1200]
+    if len(desc) < 8 or len((draft_body or "").strip()) < 40:
+        return False
+    body = (draft_body or "").strip()[:4500]
+    user_block = (
+        f"Тип паттерна: {pattern_type}\n"
+        f"Описание паттерна отказа: {desc}\n\n"
+        f"Текст черновика в очереди:\n{body}\n\n"
+        'Верни только JSON: {{"violates": true}} или {{"violates": false}}.'
+    )
+    try:
+        raw = agent.run_raw_completion(
+            system="Ты редактор. Ответь только JSON с ключом violates (boolean).",
+            user=user_block,
+            max_tokens=40,
+            temperature=0.0,
+        )
+    except Exception as exc:
+        logger.warning("check_pending_draft_against_new_pattern: %s", exc)
+        return False
+    data = _parse_gpt_json_object(raw)
+    return bool(data.get("violates")) if data else False
+
+
+def scan_pending_drafts_for_new_pattern(
+    agent: LLMAgent,
+    user_id: int,
+    exclude_draft_id: int,
+    analysis: dict[str, Any],
+) -> list[int]:
+    """Список id черновиков в очереди, которые GPT считает похожими на новый паттерн."""
+    desc = str(analysis.get("pattern_description") or "").strip()
+    ptype = str(analysis.get("pattern_type") or "unknown").strip()
+    if not desc:
+        return []
+    rows = list_user_drafts_by_status(
+        user_id, "draft", exclude_draft_id=exclude_draft_id, limit=8
+    )
+    hits: list[int] = []
+    for r in rows:
+        body = str(r.get("content") or "")
+        if check_pending_draft_against_new_pattern(agent, body, desc, ptype):
+            try:
+                hits.append(int(r["id"]))
+            except (TypeError, ValueError):
+                continue
+    return hits
+
+
 def _pick_draft_item(
     agent: LLMAgent,
     prefs: dict[str, str],
@@ -2437,6 +3246,9 @@ def _pick_draft_item(
     rejects = _reject_list(prefs)
     reject_urls, hard_hosts, soft_hosts, kw_strings = _build_reject_filters(rejects, prefs)
     host_reject_counts = _load_host_reject_counts(prefs)
+    user_promo_blocklist = _load_promo_blocklist_keys(prefs)
+    rejection_patterns = get_active_rejection_patterns(user_id)
+    blocking_patterns = patterns_for_rejection_gate(rejection_patterns)
     channel_quality = get_channel_quality_snapshot()
     blocked_src = frozenset(agent.config.blocked_search_domains)
     cfg = getattr(agent, "config", None)
@@ -2456,14 +3268,36 @@ def _pick_draft_item(
         decay_rate=decay_rate,
     )
     temp_topic_raw = (temporary_topic or "").strip()
+    rejected_cat_counts: dict[str, int] = {}
     if temp_topic_raw:
-        logger.info(
-            "temporary_topic: ignoring negative preferences for this search (topic=%r)",
-            temp_topic_raw[:120],
+        rejected_cat_counts = get_feedback_hard_reject_category_counts_in_window(
+            user_id, feedback_window
         )
-        cat_preferences = {
-            k: max(0.0, float(v)) for k, v in cat_preferences.items()
-        }
+        preserved: list[str] = []
+        softened: list[str] = []
+        new_prefs: dict[str, float] = {}
+        for k, v in cat_preferences.items():
+            v_f = float(v)
+            if v_f >= 0:
+                new_prefs[k] = v_f
+                continue
+            if int(rejected_cat_counts.get(k, 0)) > 0:
+                new_prefs[k] = v_f
+                preserved.append(k)
+            else:
+                new_prefs[k] = 0.0
+                softened.append(k)
+        cat_preferences = new_prefs
+        logger.info(
+            "temporary_topic: soften negative prefs without explicit rejects in window; "
+            "preserve negatives for rejected categories (topic=%r window=%s "
+            "rejected_by_cat=%s preserved=%s softened=%s)",
+            temp_topic_raw[:120],
+            feedback_window,
+            rejected_cat_counts,
+            preserved,
+            softened,
+        )
     feedback_cat_counts = get_feedback_category_counts_in_window(user_id, feedback_window)
     min_pref = int(getattr(cfg, "feedback_min_count_for_full_pref", 1) or 1)
     max_pref_gain = float(getattr(cfg, "feedback_pref_max_gain", 0.10) or 0.10)
@@ -2559,6 +3393,14 @@ def _pick_draft_item(
                     logger.debug(
                         "skip tavily_low_quality_domain host=%s url=%s",
                         host or "?",
+                        url_raw[:220],
+                    )
+                    continue
+                if user_promo_blocklist and url_matches_user_promo_blocklist(
+                    url_raw, user_promo_blocklist
+                ):
+                    logger.debug(
+                        "skip tavily_user_promo_blocklist url=%s",
                         url_raw[:220],
                     )
                     continue
@@ -2759,10 +3601,16 @@ def _pick_draft_item(
                 n_ch,
             )
             for p in tg_posts:
+                purl = (p.get("url") or "").strip()
+                if user_promo_blocklist and url_matches_user_promo_blocklist(
+                    purl, user_promo_blocklist
+                ):
+                    logger.debug("skip tg_user_promo_blocklist url=%s", purl[:200])
+                    continue
                 candidates.append(
                     {
                         "title": (p.get("title") or "Пост из Telegram").strip(),
-                        "url": (p.get("url") or "").strip(),
+                        "url": purl,
                         "snippet": ((p.get("content") or "").strip())[:800],
                         "from_tg": True,
                         "tg_disp": f"@{p.get('channel_username', '')}",
@@ -2886,7 +3734,7 @@ def _pick_draft_item(
         )
     ranked.sort(key=lambda x: (x[0], x[1], x[2]))
 
-    n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = n_blocked_source = n_low_score = n_topic_rel = 0
+    n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = n_blocked_source = n_low_score = n_topic_rel = n_user_promo = n_pattern = 0
     for (
         soft_pen,
         _score_sort,
@@ -2936,6 +3784,10 @@ def _pick_draft_item(
             if host.startswith("www."):
                 host = host[4:]
             logger.debug("skip blocked_source_domain domain=%s url=%s", host, url[:200])
+            continue
+        if user_promo_blocklist and url_matches_user_promo_blocklist(url, user_promo_blocklist):
+            n_user_promo += 1
+            logger.debug("Pick draft: skip user_promo_blocklist url=%r", url[:120])
             continue
         raw_eff = float(sum(score_map.values()) if USE_PATTERNS else 0) * quality_mult * breaking_mult
         rj_soft_here = _host_reject_soft_penalty_mult(
@@ -3005,6 +3857,37 @@ def _pick_draft_item(
                     url[:120],
                 )
                 continue
+        pick_title = title
+        pick_snippet = content
+        if blocking_patterns:
+            pat_res = check_candidate_against_rejection_patterns(
+                agent, pick_title, pick_snippet, blocking_patterns
+            )
+            if pat_res.get("is_similar_to_rejected"):
+                vid = pat_res.get("violated_pattern_id")
+                if vid is not None:
+                    try:
+                        bump_pattern_usage(int(vid))
+                    except (TypeError, ValueError):
+                        pass
+                n_pattern += 1
+                logger.info(
+                    "Pick draft: skip user_rejection_pattern violated_id=%s url=%r",
+                    vid,
+                    url[:120],
+                )
+                continue
+            if pat_res.get("can_be_fixed") and isinstance(pat_res.get("fixed_version"), str):
+                fx = (pat_res.get("fixed_version") or "").strip()
+                if len(fx) > 120:
+                    lines_fx = [ln for ln in fx.splitlines() if ln.strip()]
+                    if lines_fx:
+                        pick_title = lines_fx[0].strip()[:500]
+                        rest_fx = "\n".join(lines_fx[1:]).strip()
+                        if rest_fx:
+                            pick_snippet = rest_fx[:2400]
+                        else:
+                            pick_snippet = fx[:2400]
         logger.info(
             "Pick draft: выбран url=%r reject_key=%s netloc=%s tg=%s soft_penalty=%s "
             "category=%s feedback_n=%s preference[%s]=%.3f pref_gain=%.3f pref_mult=%.3f "
@@ -3030,9 +3913,9 @@ def _pick_draft_item(
             breaking_mult,
         )
         return DraftPick(
-            title=title,
+            title=pick_title,
             url=url,
-            snippet=content[:800],
+            snippet=pick_snippet[:800],
             from_telegram=bool(c.get("from_tg")),
             telegram_display=str(c.get("tg_disp") or ""),
             source_channel_username=str(c.get("source_channel_username") or "").strip().lower(),
@@ -3052,23 +3935,26 @@ def _pick_draft_item(
     else:
         logger.warning(
             "Pick draft: ни один кандидат не подошёл (mode=%s, n=%s excluded=%s hard_host=%s "
-            "url_reject=%s blocked_source=%s low_score=%s kw=%s no_url=%s topic_rel=%s)",
+            "url_reject=%s blocked_source=%s user_promo=%s low_score=%s kw=%s no_url=%s topic_rel=%s pattern=%s)",
             mode,
             len(candidates),
             n_excluded,
             n_hard_host,
             n_url_rej,
             n_blocked_source,
+            n_user_promo,
             n_low_score,
             n_kw,
             n_no_url,
             n_topic_rel,
+            n_pattern,
         )
     return None
 
 
 def draft_post_from_snippet(
     agent: LLMAgent,
+    memory: ChatMemory,
     user_id: int,
     title: str,
     snippet: str,
@@ -3102,6 +3988,7 @@ def draft_post_from_snippet(
     if voice_training_examples:
         logger.info("voice_overlay: %s примеров из voice_training", len(voice_training_examples))
     rules_overlay = build_editorial_rules_overlay(user_id)
+    style_rej_overlay = build_editor_style_rejection_overlay(user_id, limit=10)
     approved_n = _approved_posts_count(user_id)
     if approved_n >= 10:
         logger.info("editor_voice: user_id=%s voice сформирован (%s+ апрувов)", user_id, approved_n)
@@ -3120,7 +4007,12 @@ def draft_post_from_snippet(
         f"{bundle.prompt_block}\n"
     )
     raw = agent.run_raw_completion(
-        system=DRAFT_SYSTEM + voice_overlay + tg_overlay + finance_overlay + rules_overlay,
+        system=DRAFT_SYSTEM
+        + voice_overlay
+        + tg_overlay
+        + finance_overlay
+        + style_rej_overlay
+        + rules_overlay,
         user=user_block,
         max_tokens=1200,
         temperature=min(0.82, getattr(agent, "_chat_temperature", 0.75) + 0.05),
@@ -3136,7 +4028,8 @@ def draft_post_from_snippet(
     verification_line = _source_verification_line(url, from_telegram=from_telegram)
     if verification_line and verification_line not in text:
         text = f"{text.rstrip()}\n\n{verification_line}".strip()
-    ok_quality, quality_reason = _assess_draft_quality(text)
+    len_slack = quality_min_len_slack_from_prefs(_prefs(memory, user_id))
+    ok_quality, quality_reason = _assess_draft_quality(text, min_len_slack=len_slack)
     if not ok_quality:
         logger.warning(
             "weak draft detected reason=%s url=%s",
@@ -3303,6 +4196,7 @@ def create_draft_from_search(
         body, ok_quality, quality_reason, confidence, needs_ver, seo_score = (
             draft_post_from_snippet(
                 agent,
+                memory,
                 user_id,
                 picked.title,
                 picked.snippet,
@@ -3368,7 +4262,8 @@ def create_draft_from_search(
         return False, str(res), None
     if temporary_topic and str(temporary_topic).strip():
         logger.info(
-            "create_draft_from_search: created draft_id=%s via temporary_topic=%r (preferences ignored)",
+            "create_draft_from_search: created draft_id=%s via temporary_topic=%r "
+            "(negative prefs softened except categories with rejected feedback in window)",
             int(res),
             str(temporary_topic).strip()[:200],
         )
