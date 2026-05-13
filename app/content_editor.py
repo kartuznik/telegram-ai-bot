@@ -2370,6 +2370,42 @@ def _tavily_multi_topic_query(topic: str, date_hint: str) -> str:
     return base
 
 
+def verify_topic_relevance(agent: LLMAgent, text: str, topic: str) -> bool:
+    """GPT: новость действительно про тему или только случайное упоминание слова."""
+    topic_s = (topic or "").strip()[:400]
+    t = (text or "").strip()[:4000]
+    if not topic_s or not t:
+        return True
+    try:
+        raw = agent.run_raw_completion(
+            system=(
+                "Ты оцениваешь релевантность новости к заданной теме. "
+                "Ответь ровно одним словом: ДА или НЕТ.\n"
+                "ДА — если материал в основном про эту тему.\n"
+                "НЕТ — если слово темы только мимоходом, в другом контексте, "
+                "метафоре, рекламе или заголовке-приманке без содержания по теме."
+            ),
+            user=(
+                f"Тема: {topic_s}\n\nТекст (заголовок и сниппет):\n{t}\n\n"
+                f"Это в основном новость про «{topic_s}», а не случайное упоминание?"
+            ),
+            max_tokens=12,
+            temperature=0.0,
+        )
+    except Exception as exc:
+        logger.warning("verify_topic_relevance: GPT error, принимаем кандидата: %s", exc)
+        return True
+    low = (raw or "").strip().lower()
+    first = low.split()[0] if low else ""
+    if first.startswith("нет") or low.startswith("no"):
+        return False
+    if first.startswith("да") or low.startswith("yes"):
+        return True
+    if "нет" in low[:24] and "да" not in low[:12]:
+        return False
+    return True
+
+
 def _pick_draft_item(
     agent: LLMAgent,
     prefs: dict[str, str],
@@ -2564,8 +2600,8 @@ def _pick_draft_item(
                 q[:400],
                 max_results=6,
                 days=primary_days,
-                topic="news",
-                country="RU",
+                topic="general",
+                country="russia",
                 include_published_date=True,
                 exclude_domains=promo_domains,
             )
@@ -2581,8 +2617,8 @@ def _pick_draft_item(
                     q[:400],
                     max_results=6,
                     days=fallback_days,
-                    topic="news",
-                    country="RU",
+                    topic="general",
+                    country="russia",
                     include_published_date=True,
                     exclude_domains=promo_domains,
                 )
@@ -2608,8 +2644,8 @@ def _pick_draft_item(
                     q_broad[:400],
                     max_results=8,
                     days=days_3,
-                    topic="news",
-                    country="RU",
+                    topic="general",
+                    country="russia",
                     include_published_date=True,
                     exclude_domains=promo_domains,
                 )
@@ -2625,8 +2661,8 @@ def _pick_draft_item(
                     q[:400],
                     max_results=3,
                     days=primary_days,
-                    topic="news",
-                    country="RU",
+                    topic="general",
+                    country="russia",
                     include_published_date=True,
                     exclude_domains=promo_domains,
                 )
@@ -2642,8 +2678,8 @@ def _pick_draft_item(
                         q[:400],
                         max_results=3,
                         days=fallback_days,
-                        topic="news",
-                        country="RU",
+                        topic="general",
+                        country="russia",
                         include_published_date=True,
                         exclude_domains=promo_domains,
                     )
@@ -2664,8 +2700,8 @@ def _pick_draft_item(
                         q_broad[:400],
                         max_results=8,
                         days=days_3,
-                        topic="news",
-                        country="RU",
+                        topic="general",
+                        country="russia",
                         include_published_date=True,
                         exclude_domains=promo_domains,
                     )
@@ -2677,50 +2713,62 @@ def _pick_draft_item(
                     mode,
                 )
 
+    web_candidates_after_tavily = sum(1 for c in candidates if not c.get("from_tg"))
     if mode in ("tg", "both"):
-        user_tg_raw = (prefs.get(PREF_TG_CHANNELS) or "").strip()
-        user_tg_list = _parse_username_csv(user_tg_raw)
-        chans = _merged_tg_channel_names(prefs)
-        n_ch = len(chans)
-        head = 12
-        preview = ",".join(f"@{x}" for x in chans[:head])
-        tail = f" …(+{n_ch - head} каналов в лог не помещаю)" if n_ch > head else ""
-        if user_tg_list:
+        skip_tg_after_empty_web = (
+            mode == "both"
+            and bool(getattr(agent, "tavily", None))
+            and web_candidates_after_tavily == 0
+        )
+        if skip_tg_after_empty_web:
             logger.info(
-                "TG fetch: total_channels=%s из настроек пользователя, базовый список (первые %s): %s%s; "
-                "порядок HTTP после shuffle — см. tg_feed: fetch_many_channels",
-                n_ch,
-                min(n_ch, head),
-                preview,
-                tail,
+                "Pick draft: режим both, веб-кандидатов после Tavily нет — "
+                "не подмешиваю Telegram (без слабого TG-only fallback)"
             )
         else:
+            user_tg_raw = (prefs.get(PREF_TG_CHANNELS) or "").strip()
+            user_tg_list = _parse_username_csv(user_tg_raw)
+            chans = _merged_tg_channel_names(prefs)
+            n_ch = len(chans)
+            head = 12
+            preview = ",".join(f"@{x}" for x in chans[:head])
+            tail = f" …(+{n_ch - head} каналов в лог не помещаю)" if n_ch > head else ""
+            if user_tg_list:
+                logger.info(
+                    "TG fetch: total_channels=%s из настроек пользователя, базовый список (первые %s): %s%s; "
+                    "порядок HTTP после shuffle — см. tg_feed: fetch_many_channels",
+                    n_ch,
+                    min(n_ch, head),
+                    preview,
+                    tail,
+                )
+            else:
+                logger.info(
+                    "TG fetch: total_channels=%s по умолчанию, базовый список (первые %s): %s%s; "
+                    "порядок после shuffle — см. tg_feed: fetch_many_channels",
+                    n_ch,
+                    min(n_ch, head),
+                    preview,
+                    tail,
+                )
+            # Порядок HTTP к каналам задаётся в fetch_many_channels (random.shuffle).
+            tg_posts = fetch_many_channels(chans, per_channel=2)
             logger.info(
-                "TG fetch: total_channels=%s по умолчанию, базовый список (первые %s): %s%s; "
-                "порядок после shuffle — см. tg_feed: fetch_many_channels",
+                "TG fetch result: total_posts=%s from %s channels",
+                len(tg_posts),
                 n_ch,
-                min(n_ch, head),
-                preview,
-                tail,
             )
-        # Порядок HTTP к каналам задаётся в fetch_many_channels (random.shuffle).
-        tg_posts = fetch_many_channels(chans, per_channel=2)
-        logger.info(
-            "TG fetch result: total_posts=%s from %s channels",
-            len(tg_posts),
-            n_ch,
-        )
-        for p in tg_posts:
-            candidates.append(
-                {
-                    "title": (p.get("title") or "Пост из Telegram").strip(),
-                    "url": (p.get("url") or "").strip(),
-                    "snippet": ((p.get("content") or "").strip())[:800],
-                    "from_tg": True,
-                    "tg_disp": f"@{p.get('channel_username', '')}",
-                    "source_channel_username": str(p.get("channel_username") or "").strip().lstrip("@").lower(),
-                }
-            )
+            for p in tg_posts:
+                candidates.append(
+                    {
+                        "title": (p.get("title") or "Пост из Telegram").strip(),
+                        "url": (p.get("url") or "").strip(),
+                        "snippet": ((p.get("content") or "").strip())[:800],
+                        "from_tg": True,
+                        "tg_disp": f"@{p.get('channel_username', '')}",
+                        "source_channel_username": str(p.get("channel_username") or "").strip().lstrip("@").lower(),
+                    }
+                )
 
     logger.info(
         "Pick draft: source_mode=%s кандидатов=%s (web+TG)",
@@ -2838,7 +2886,7 @@ def _pick_draft_item(
         )
     ranked.sort(key=lambda x: (x[0], x[1], x[2]))
 
-    n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = n_blocked_source = n_low_score = 0
+    n_excluded = n_hard_host = n_url_rej = n_kw = n_no_url = n_blocked_source = n_low_score = n_topic_rel = 0
     for (
         soft_pen,
         _score_sort,
@@ -2947,6 +2995,16 @@ def _pick_draft_item(
                 logger.debug("Pick draft: skip keyword %r", matched_bad)
                 continue
         final_mult = pref_mult * diversity_mult * novelty_mult
+        if temp_topic_raw:
+            blob_rel = f"{title}\n{content}".strip()
+            if not verify_topic_relevance(agent, blob_rel, temp_topic_raw):
+                n_topic_rel += 1
+                logger.info(
+                    "Pick draft: verify_topic_relevance отклонил кандидата topic=%r url=%r",
+                    temp_topic_raw[:120],
+                    url[:120],
+                )
+                continue
         logger.info(
             "Pick draft: выбран url=%r reject_key=%s netloc=%s tg=%s soft_penalty=%s "
             "category=%s feedback_n=%s preference[%s]=%.3f pref_gain=%.3f pref_mult=%.3f "
@@ -2994,7 +3052,7 @@ def _pick_draft_item(
     else:
         logger.warning(
             "Pick draft: ни один кандидат не подошёл (mode=%s, n=%s excluded=%s hard_host=%s "
-            "url_reject=%s blocked_source=%s low_score=%s kw=%s no_url=%s)",
+            "url_reject=%s blocked_source=%s low_score=%s kw=%s no_url=%s topic_rel=%s)",
             mode,
             len(candidates),
             n_excluded,
@@ -3004,6 +3062,7 @@ def _pick_draft_item(
             n_low_score,
             n_kw,
             n_no_url,
+            n_topic_rel,
         )
     return None
 

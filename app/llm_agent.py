@@ -9,6 +9,7 @@ import httpx
 import requests
 from openai import APIStatusError, APITimeoutError, OpenAI
 from tavily import TavilyClient
+from tavily.errors import BadRequestError
 from tavily.errors import TimeoutError as TavilyTimeoutError
 
 from app.config import Config
@@ -952,7 +953,12 @@ class LLMAgent:
         return min(raw, 120.0)
 
     def _tavily_search(self, query: str, max_results: int, **search_kwargs) -> dict | None:
-        """Синхронный поиск Tavily с ретраями только при таймауте; dict ответа API или None при полном провале."""
+        """Синхронный поиск Tavily с ретраями по таймауту.
+
+        Параметр country в Tavily допустим только вместе с topic=general (см. API);
+        при topic=news часто приходит 400 Invalid country — тогда один повтор без country.
+        Если с country пришёл пустой results — один повтор без country.
+        """
         if not self.tavily:
             return None
         total = 1 + max(0, self._tavily_max_retries)
@@ -960,9 +966,24 @@ class LLMAgent:
         backoff_base = 1.0
         backoff_cap = 8.0
         q_log = (query or "")[:400].replace("\n", " ")
-        days_val = search_kwargs.get("days", "not_set")
-        excluded_count = len(search_kwargs.get("exclude_domains") or [])
-        country_val = search_kwargs.get("country", "not_set")
+        base_kw = dict(search_kwargs)
+        initial_country = base_kw.get("country")
+
+        def _country_log_label(kw: dict[str, object]) -> str:
+            c = kw.get("country")
+            if not c:
+                return "disabled"
+            if str(c).strip().lower() == "russia":
+                return "Russia"
+            return str(c)
+
+        def _invoke_tavily(timeout_sec: float, kw: dict[str, object]) -> dict:
+            return self.tavily.search(
+                query=query,
+                max_results=max_results,
+                timeout=timeout_sec,
+                **kw,
+            )
 
         for attempt in range(1, total + 1):
             timeout_sec = self._tavily_timeout_for_attempt(attempt)
@@ -971,77 +992,110 @@ class LLMAgent:
                 if abs(timeout_sec - round(timeout_sec)) < 1e-9
                 else round(timeout_sec, 1)
             )
-            logger.info(
-                "Tavily search: query=%r, timeout=%ss, attempt=%s/%s, days=%s, "
-                "exclude_domains_count=%s, country=%s",
-                q_log,
-                t_display,
-                attempt,
-                total,
-                days_val,
-                excluded_count,
-                country_val,
-            )
-            try:
-                result = self.tavily.search(
-                    query=query,
-                    max_results=max_results,
-                    timeout=timeout_sec,
-                    **search_kwargs,
-                )
-            except (TavilyTimeoutError, requests.exceptions.Timeout) as exc:
-                if attempt < total:
-                    next_timeout = self._tavily_timeout_for_attempt(attempt + 1)
-                    nt_display = (
-                        int(next_timeout)
-                        if abs(next_timeout - round(next_timeout)) < 1e-9
-                        else round(next_timeout, 1)
-                    )
-                    delay = min(
-                        backoff_base * (mult ** (attempt - 1)),
-                        backoff_cap,
-                    )
-                    logger.warning(
-                        "Tavily timeout, retrying with timeout=%ss, attempt=%s/%s",
-                        nt_display,
-                        attempt + 1,
-                        total,
-                    )
-                    time.sleep(delay)
-                    continue
-                logger.error(
-                    "Tavily failed after %s attempts: %s",
-                    total,
-                    exc,
-                )
-                return None
-            except Exception as exc:
-                err_msg = str(exc).strip() or "(без текста)"
-                logger.error(
-                    "Tavily search failed (non-timeout) on attempt %s/%s: %s: %s",
+            call_kw: dict[str, object] = dict(base_kw)
+            stripped_country_for_empty = False
+
+            while True:
+                days_val = call_kw.get("days", "not_set")
+                excluded_count = len(call_kw.get("exclude_domains") or [])
+                country_logged = _country_log_label(call_kw)
+                logger.info(
+                    "Tavily search: query=%r, timeout=%ss, attempt=%s/%s, days=%s, "
+                    "exclude_domains_count=%s, country=%s",
+                    q_log,
+                    t_display,
                     attempt,
                     total,
-                    type(exc).__name__,
-                    err_msg[:500],
+                    days_val,
+                    excluded_count,
+                    country_logged,
                 )
-                logger.debug("Tavily search non-timeout detail", exc_info=True)
-                return None
+                try:
+                    result = _invoke_tavily(timeout_sec, call_kw)
+                except BadRequestError as exc:
+                    err_msg = str(exc).strip() or "(без текста)"
+                    if call_kw.pop("country", None) is not None and (
+                        "Invalid country" in err_msg
+                        or "country" in err_msg.lower()
+                    ):
+                        logger.warning(
+                            "Tavily country param failed, retrying without: %s",
+                            err_msg[:220],
+                        )
+                        continue
+                    logger.error(
+                        "Tavily search BadRequest on attempt %s/%s: %s",
+                        attempt,
+                        total,
+                        err_msg[:500],
+                    )
+                    return None
+                except (TavilyTimeoutError, requests.exceptions.Timeout) as exc:
+                    if attempt < total:
+                        next_timeout = self._tavily_timeout_for_attempt(attempt + 1)
+                        nt_display = (
+                            int(next_timeout)
+                            if abs(next_timeout - round(next_timeout)) < 1e-9
+                            else round(next_timeout, 1)
+                        )
+                        delay = min(
+                            backoff_base * (mult ** (attempt - 1)),
+                            backoff_cap,
+                        )
+                        logger.warning(
+                            "Tavily timeout, retrying with timeout=%ss, attempt=%s/%s",
+                            nt_display,
+                            attempt + 1,
+                            total,
+                        )
+                        time.sleep(delay)
+                    else:
+                        logger.error(
+                            "Tavily failed after %s attempts: %s",
+                            total,
+                            exc,
+                        )
+                    break
+                except Exception as exc:
+                    err_msg = str(exc).strip() or "(без текста)"
+                    logger.error(
+                        "Tavily search failed (non-timeout) on attempt %s/%s: %s: %s",
+                        attempt,
+                        total,
+                        type(exc).__name__,
+                        err_msg[:500],
+                    )
+                    logger.debug("Tavily search non-timeout detail", exc_info=True)
+                    return None
 
-            if not isinstance(result, dict):
-                logger.error(
-                    "Tavily search: unexpected response type=%s",
-                    type(result).__name__,
+                if not isinstance(result, dict):
+                    logger.error(
+                        "Tavily search: unexpected response type=%s",
+                        type(result).__name__,
+                    )
+                    return None
+                logger.debug("Tavily search response keys: %s", list(result.keys()))
+                items = result.get("results") or []
+                if (
+                    len(items) == 0
+                    and initial_country
+                    and call_kw.get("country") is not None
+                    and not stripped_country_for_empty
+                ):
+                    logger.warning(
+                        "Tavily returned 0 results with country=%s, retrying without",
+                        country_logged,
+                    )
+                    call_kw.pop("country", None)
+                    stripped_country_for_empty = True
+                    continue
+                logger.info(
+                    "Tavily search: success, results=%s, attempts_used=%s/%s",
+                    len(items),
+                    attempt,
+                    total,
                 )
-                return None
-            logger.debug("Tavily search response keys: %s", list(result.keys()))
-            items = result.get("results") or []
-            logger.info(
-                "Tavily search: success, results=%s, attempts_used=%s/%s",
-                len(items),
-                attempt,
-                total,
-            )
-            return result
+                return result
 
         return None
 
