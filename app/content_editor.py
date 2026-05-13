@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -105,6 +106,18 @@ REJECT_REASON_SLUGS = frozenset(
         "bad_source",
         "promotional",
         REJECT_REASON_SLUG_SKIP,
+    }
+)
+
+# Нормализация pattern_type из GPT при разборе отклонённых черновиков (один список — без дублей в коде).
+ALLOWED_REJECTION_PATTERN_TYPES: frozenset[str] = frozenset(
+    {
+        "weak_content",
+        "promotional",
+        "bad_source",
+        "not_interested",
+        "editor_preference",
+        "unknown",
     }
 )
 
@@ -2767,15 +2780,122 @@ _VERIFICATION_WARNING_HEAD_RE = re.compile(
     flags=re.DOTALL,
 )
 
+_RELATED_NEWS_LINE_RE = re.compile(
+    r"(?m)^\s*Кстати,\s*ранее\s+по\s+теме:\s*.+$",
+    flags=re.IGNORECASE,
+)
+
 
 def strip_verification_warning_block(text: str) -> str:
     """Убирает служебный блок «⚠️ Требует проверки» (и хвост до пустой строки или конца текста)."""
     return _VERIFICATION_WARNING_HEAD_RE.sub("", text or "").strip()
 
 
+def strip_related_news_block(text: str) -> str:
+    """Убирает вставку «Кстати, ранее по теме: …» перед публикацией в канал."""
+    t = _RELATED_NEWS_LINE_RE.sub("", text or "")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+_HASHTAG_STOPWORDS: frozenset[str] = frozenset(
+    """
+    это того тем что как для при без над под про все еще уже или же
+    лишь вот тут там куда от из по ко да не ни на мы вы они она его
+    них ней нем нас вас них ему ей им бы был была были будут было
+    быть может можно нужно надо если чтобы после также такой такая
+    такие этот эта эти того этой этом этих который которая которое
+    которых когда где кто чем чего кому чему кого чему чем чём
+    самый самая самое самые очень более менее очень весь вся всё все
+    один одна одно одни первый первая первое новый новая новое
+    другой другая другое другие любой любая любое любые каждый
+    мой твой наш ваш их свой своя своё свои так же чем то что бы
+    здесь тут сейчас тогда потом очень весь вся всего всей всем
+    источник ссылка читать подробнее читайте также сообщает сообщили
+    сообщает сообщение стало стали стать будет были был была
+    """.split()
+)
+
+
+def _sanitize_hashtag_token(raw: str) -> str:
+    s = (raw or "").strip().lower().replace("ё", "е")
+    s = re.sub(r"[^0-9a-zа-яё_]+", "", s)
+    return s[:48]
+
+
+def build_channel_hashtag_footer(body: str) -> str:
+    """
+    3–5 хэштегов в конец поста: всегда #новости, рубрика из detect_primary_category,
+    1–2 ключевых слова из текста (кириллица/латиница).
+    """
+    text = (body or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    head = (lines[0] if lines else "").strip()
+    tail = "\n".join(lines[1:])[:6000]
+    tags: list[str] = ["#новости"]
+    seen = {t.lower() for t in tags}
+
+    cat = detect_primary_category(head, tail)
+    cat_t = _sanitize_hashtag_token(str(cat or ""))
+    if cat_t and cat_t not in ("новости", "other", ""):
+        ht = f"#{cat_t}"
+        if ht.lower() not in seen:
+            tags.append(ht)
+            seen.add(ht.lower())
+
+    words = re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", text)
+    freq: Counter[str] = Counter()
+    for w in words:
+        wl = w.lower().replace("ё", "е")
+        if wl in _HASHTAG_STOPWORDS or len(wl) < 2:
+            continue
+        freq[wl] += 1
+    for w, _c in freq.most_common(40):
+        tok = _sanitize_hashtag_token(w)
+        if len(tok) < 2:
+            continue
+        ht = f"#{tok}"
+        if ht.lower() in seen:
+            continue
+        tags.append(ht)
+        seen.add(ht.lower())
+        if len(tags) >= 5:
+            break
+
+    while len(tags) < 3:
+        for filler in ("события", "факты", "обновление"):
+            ht = f"#{filler}"
+            if ht.lower() not in seen:
+                tags.append(ht)
+                seen.add(ht.lower())
+                break
+        else:
+            break
+        if len(tags) >= 3:
+            break
+
+    return " ".join(tags[:5])
+
+
+def append_channel_hashtag_footer(text: str) -> str:
+    base = (text or "").strip()
+    if not base:
+        return base
+    footer = build_channel_hashtag_footer(base)
+    if not footer:
+        return base
+    combined = f"{base.rstrip()}\n\n{footer}".strip()
+    if len(combined) > 4090:
+        combined = combined[:4080].rstrip() + "…"
+    return combined
+
+
 def channel_publish_text_from_draft_body(body: str) -> str:
     """Текст для публикации в канал: без служебных строк, которые показываются только в ЛС."""
     body = strip_verification_warning_block(body)
+    body = strip_related_news_block(body)
     lines_out: list[str] = []
     for line in (body or "").splitlines():
         stripped = line.strip()
@@ -2786,8 +2906,8 @@ def channel_publish_text_from_draft_body(body: str) -> str:
         lines_out.append(line)
     out = "\n".join(lines_out).strip()
     if not out:
-        return (body or "").strip()
-    return out
+        return append_channel_hashtag_footer((body or "").strip())
+    return append_channel_hashtag_footer(out)
 
 
 def draft_dm_text(row: dict[str, Any]) -> str:
@@ -3002,7 +3122,7 @@ def _parse_gpt_json_object(raw: str | None) -> dict[str, Any] | None:
 _REJECTION_ANALYSIS_SYSTEM = (
     "Ты редактор новостного канала. Проанализируй отклонённый черновик и верни ТОЛЬКО один JSON-объект "
     "без пояснений и без markdown. Ключи строго: problems (массив строк), pattern_description (строка), "
-    "pattern_type (строка: weak_content|promotional|bad_source|not_interested|unknown), "
+    "pattern_type (строка: weak_content|promotional|bad_source|not_interested|editor_preference|unknown), "
     "keywords_to_avoid (массив строк или []), requirements (массив строк)."
 )
 
@@ -3050,7 +3170,7 @@ def analyze_rejected_draft_with_gpt(
     if not isinstance(data.get("keywords_to_avoid"), list):
         data["keywords_to_avoid"] = []
     pt = str(data.get("pattern_type") or "unknown").strip().lower()
-    if pt not in ("weak_content", "promotional", "bad_source", "not_interested", "unknown"):
+    if pt not in ALLOWED_REJECTION_PATTERN_TYPES:
         data["pattern_type"] = "unknown"
     return data
 
