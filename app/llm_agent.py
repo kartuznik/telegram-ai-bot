@@ -364,6 +364,9 @@ class LLMAgent:
         self._tavily_timeout_seconds = config.tavily_timeout_seconds
         self._tavily_max_retries = config.tavily_max_retries
         self._tavily_retry_backoff_multiplier = config.tavily_retry_backoff_multiplier
+        self._tavily_freshness_days = int(
+            getattr(config, "tavily_freshness_days", 2) or 2
+        )
         logger.info(
             "Модель: chat_temperature=%s, vision_temperature=%s",
             self._chat_temperature,
@@ -371,10 +374,11 @@ class LLMAgent:
         )
         if config.tavily_api_key:
             logger.info(
-                "Tavily: API ключ задан (timeout_base=%ss, max_retries=%s, backoff_mult=%s)",
+                "Tavily: API ключ задан (timeout_base=%ss, max_retries=%s, backoff_mult=%s, freshness_days=%s)",
                 self._tavily_timeout_seconds,
                 self._tavily_max_retries,
                 self._tavily_retry_backoff_multiplier,
+                self._tavily_freshness_days,
             )
         else:
             logger.info("Tavily: не настроен")
@@ -1139,8 +1143,44 @@ class LLMAgent:
         if not self.tavily:
             logger.warning("Tavily: поиск пропущен — нет API ключа")
             return "🌐 Поиск недоступен: добавь TAVILY_API_KEY в .env"
-        logger.info("Tavily: запрос поиска, длина запроса=%s симв.", len(query))
-        result = self._tavily_search(query, max_results=3)
+        need_freshness = self._should_trigger_web_search(query)
+        days = max(1, int(self._tavily_freshness_days or 2))
+        search_kwargs: dict = {"max_results": 3}
+        if need_freshness:
+            # Канон freshness (минимум этапа 1): topic=news + days; без country (часто 400 на news).
+            search_kwargs.update(
+                {
+                    "topic": "news",
+                    "days": days,
+                    "include_published_date": True,
+                }
+            )
+            logger.info(
+                "Tavily core search: freshness path tavily_days=%s topic=news query=%r",
+                days,
+                query[:240],
+            )
+        else:
+            logger.info(
+                "Tavily core search: general path query=%r",
+                query[:240],
+            )
+        result = self._tavily_search(query, **search_kwargs)
+        if result is None and need_freshness:
+            # Fallback: расширить окно days×2 при пустой/упавшей выдаче.
+            wider = min(30, days * 2)
+            logger.warning(
+                "Tavily core freshness empty/fail days=%s; fallback days=%s",
+                days,
+                wider,
+            )
+            result = self._tavily_search(
+                query,
+                max_results=3,
+                topic="news",
+                days=wider,
+                include_published_date=True,
+            )
         if result is None:
             return "🌐 Не удалось выполнить веб-поиск. Попробуй повторить запрос позже."
         items = result.get("results", [])
@@ -1152,8 +1192,19 @@ class LLMAgent:
             title = item.get("title", "Без названия")
             url = item.get("url", "")
             content = (item.get("content", "") or "").strip().replace("\n", " ")
-            lines.append(f"— {title}\n({url})\n{content[:240]}")
-        logger.info("Tavily: сформирован контекст для модели, результатов=%s", len(items))
+            published = (
+                item.get("published_date")
+                or item.get("published_at")
+                or item.get("published")
+                or ""
+            )
+            pub_bit = f"\n📅 {published}" if published else ""
+            lines.append(f"— {title}\n({url}){pub_bit}\n{content[:240]}")
+        logger.info(
+            "Tavily: сформирован контекст для модели, результатов=%s need_freshness=%s",
+            len(items),
+            need_freshness,
+        )
         return "🌐 Результаты веб-поиска:\n" + "\n\n".join(lines)
 
     def run_raw_completion(

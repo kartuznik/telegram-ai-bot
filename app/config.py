@@ -93,6 +93,9 @@ class Config:
     chat_temperature: float = 0.75
     vision_temperature: float = 0.38
     concierge_enabled: bool = True
+    anchors_enabled: bool = True
+    content_editor_autofetch_enabled: bool = False
+    tavily_freshness_days: int = 2
     log_level: str = "INFO"
     telegram_proxy_fallback_direct: bool = False
     max_user_templates: int = 30
@@ -166,10 +169,19 @@ def load_config() -> Config:
     chat_temp = _parse_temperature("MODEL_TEMPERATURE", 0.75, 0.5, 0.9)
     vision_temp = _parse_temperature("VISION_MODEL_TEMPERATURE", 0.38, 0.15, 0.55)
     concierge_on = _parse_bool_env("CONCIERGE_ENABLED", True)
+    anchors_on = _parse_bool_env("ANCHORS_ENABLED", True)
+    autofetch_on = _parse_bool_env("CONTENT_EDITOR_AUTOFETCH_ENABLED", False)
+    # PREF_AUTO_ENABLED в .env — алиас «выключить autofetch» (0/false), если явный флаг не задан.
+    pref_auto_raw = os.getenv("PREF_AUTO_ENABLED", "").strip().lower()
+    if pref_auto_raw in ("0", "false", "no", "off", "нет") and os.getenv(
+        "CONTENT_EDITOR_AUTOFETCH_ENABLED", ""
+    ).strip() == "":
+        autofetch_on = False
+    tavily_freshness_days = _parse_int_env("TAVILY_FRESHNESS_DAYS", 2, 1, 30)
     log_level = _parse_log_level_env("LOG_LEVEL", "INFO")
     telegram_proxy_fallback = _parse_bool_env("TELEGRAM_PROXY_FALLBACK_DIRECT", False)
     max_templates = _parse_int_env("MAX_USER_TEMPLATES", 30, 1, 100)
-    max_anchors = _parse_int_env("MAX_USER_ANCHORS", 25, 1, 100)
+    max_anchors = _parse_int_env("MAX_USER_ANCHORS", 25, 0, 100)
     tavily_timeout = _parse_int_env("TAVILY_TIMEOUT_SECONDS", 36, 10, 120)
     tavily_retries = _parse_int_env("TAVILY_MAX_RETRIES", 2, 0, 5)
     tavily_backoff = _parse_float_env("TAVILY_RETRY_BACKOFF_MULTIPLIER", 2.0, 1.0, 4.0)
@@ -218,6 +230,9 @@ def load_config() -> Config:
         chat_temperature=chat_temp,
         vision_temperature=vision_temp,
         concierge_enabled=concierge_on,
+        anchors_enabled=anchors_on,
+        content_editor_autofetch_enabled=autofetch_on,
+        tavily_freshness_days=tavily_freshness_days,
         log_level=log_level,
         telegram_proxy_fallback_direct=telegram_proxy_fallback,
         max_user_templates=max_templates,

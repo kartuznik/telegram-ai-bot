@@ -231,6 +231,11 @@ config = load_config()
 logging.basicConfig(level=getattr(logging, config.log_level, logging.INFO))
 logger = logging.getLogger(__name__)
 
+# SQLite schema до Memory/редактора: иначе module-level init читает таблицы до CREATE.
+init_db()
+init_stats_db()
+init_admin_db()
+
 memory = ChatMemory(max_messages=config.max_history_messages)
 init_content_editor_defaults(config)
 migrate_strip_vesti_reject_hints(memory)
@@ -2292,6 +2297,12 @@ async def text_handler(message: Message, bot: Bot) -> None:
         return
 
     am, areason, atitle = classify_anchor_command(text)
+    if am and not getattr(config, "anchors_enabled", True):
+        await message.answer(
+            "Якоря временно отключены в этой сборке (ANCHORS_ENABLED=false). "
+            "Вернём в следующем этапе 🔖"
+        )
+        return
     if am:
         if areason == "delete_empty":
             await message.answer(
@@ -3336,13 +3347,19 @@ async def main() -> None:
         agent.close()
         return
 
-    autofetch_task = asyncio.create_task(
-        run_content_editor_autofetch_loop(bot, agent, memory)
-    )
-    logger.info(
-        "Auto-search: background task scheduled (task=%r)",
-        autofetch_task,
-    )
+    autofetch_task = None
+    if getattr(config, "content_editor_autofetch_enabled", False):
+        autofetch_task = asyncio.create_task(
+            run_content_editor_autofetch_loop(bot, agent, memory)
+        )
+        logger.info(
+            "Auto-search: background task scheduled (task=%r)",
+            autofetch_task,
+        )
+    else:
+        logger.info(
+            "Auto-search: autofetch DISABLED (CONTENT_EDITOR_AUTOFETCH_ENABLED/PREF_AUTO_ENABLED) — manual editor only"
+        )
     diag_notify = (
         config.admin_id
         if config.admin_id is not None
@@ -3371,11 +3388,12 @@ async def main() -> None:
             await diag_task
         except asyncio.CancelledError:
             pass
-        autofetch_task.cancel()
-        try:
-            await autofetch_task
-        except asyncio.CancelledError:
-            pass
+        if autofetch_task is not None:
+            autofetch_task.cancel()
+            try:
+                await autofetch_task
+            except asyncio.CancelledError:
+                pass
         agent.close()
         await bot.session.close()
         logger.info("Бот остановлен корректно")

@@ -1,6 +1,8 @@
 # Кузьма — умный Телеграм-бот ассистент
 
-**Кузьма** — это многофункциональный ИИ-ассистент для Telegram на базе **OpenAI GPT-4o** (чат, голос Whisper, изображения Vision, файлы PDF/TXT) с живым стилем ответов, веб-поиском через **Tavily**, режимом **консьержа** (подбор актуальных вариантов из интернета), **редактором контента** для канала [@kriptogeograph](https://t.me/kriptogeograph) (черновики, авто-поиск, апрув в личке), **симулятором сценариев** («что если…» с тремя ветками), **шаблонами** и **якорями** в диалоге, статистикой и админ-командами.
+**Кузьма (Кузя)** — ИИ-ассистент для Telegram на базе **OpenAI GPT-4o** (чат, голос Whisper, изображения Vision, файлы PDF/TXT) с веб-поиском через **Tavily**, памятью диалога и **ручным редактором контента** для канала [@kriptogeograph](https://t.me/kriptogeograph).
+
+**Этап 1 (текущий прод-scope):** ядро (ассистент + web search + memory + роли + self-heal) + **ручной** редактор постов. Консьерж и якоря **отключены флагами** до этапа 2. Autofetch редактора по умолчанию **выключен**.
 
 > Скриншоты можно добавить сюда позже (`![Пример](docs/screenshot.png)`).
 
@@ -106,7 +108,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-В логах должны появиться строки о инициализации БД и запуске polling. Если указан `TAVILY_API_KEY`, в логах будет отметка о Tavily. Фоновая задача авто-поиска черновиков стартует вместе с ботом (интервал между **полными проходами** по пользователям — **15 минут**; частота **нового** черновика для одного пользователя задаётся в `/editor_prefs авто:ЧАСЫ`).
+В логах должны появиться строки о инициализации БД и запуске polling. Если указан `TAVILY_API_KEY`, в логах будет отметка о Tavily. Фоновый авто-поиск черновиков **не стартует по умолчанию** (`CONTENT_EDITOR_AUTOFETCH_ENABLED=false` / `PREF_AUTO_ENABLED=0`); ручные команды редактора (`/drafts`, `/editor_start`, `/find`) работают. Если autofetch явно включён — интервал между **полными проходами** по пользователям — **15 минут**; частота **нового** черновика для одного пользователя задаётся в `/editor_prefs авто:ЧАСЫ`.
 
 ---
 
@@ -128,11 +130,15 @@ python main.py
 | `TELEGRAM_PROXY_PASSWORD` | Нет | Пароль Telegram-прокси. |
 | `TELEGRAM_PROXY_FALLBACK_DIRECT` | Нет | `1` / `true` — при сбоях Telegram через `TELEGRAM_PROXY_*` один раз переключить сессию на прямое подключение к api.telegram.org. |
 | `LOG_LEVEL` | Нет | Уровень логирования: `DEBUG` / `INFO` / `WARNING` / `ERROR`. По умолчанию `INFO`. |
-| `CONCIERGE_ENABLED` | Нет | `0` / `false` — отключить логику консьержа. По умолчанию включён. |
+| `CONCIERGE_ENABLED` | Нет | `0` / `false` — отключить логику консьержа. По умолчанию включён. На этапе 1 воскрешения в проде: **`false`**. |
+| `ANCHORS_ENABLED` | Нет | `0` / `false` — отключить команды якорей. По умолчанию включены. На этапе 1: **`false`**. |
+| `CONTENT_EDITOR_AUTOFETCH_ENABLED` | Нет | `1` / `true` — фоновый цикл авто-поиска черновиков. По умолчанию **`false`** (ручной редактор: `/drafts`, `/editor_start`, `/find`). |
+| `PREF_AUTO_ENABLED` | Нет | Алиас: `0` / `false` выключает autofetch, если `CONTENT_EDITOR_AUTOFETCH_ENABLED` не задан явно. |
+| `TAVILY_FRESHNESS_DAYS` | Нет | Окно свежести для core-поиска при маркерах актуальности (`topic=news`, days=N). По умолчанию `2` (1–30). |
 | `MODEL_TEMPERATURE` | Нет | Температура чата, диапазон в коде 0.5–0.9, по умолчанию `0.75`. |
 | `VISION_MODEL_TEMPERATURE` | Нет | Температура vision, 0.15–0.55, по умолчанию `0.38`. |
 | `MAX_USER_TEMPLATES` | Нет | Лимит шаблонов на пользователя (1–100), по умолчанию `30`. |
-| `MAX_USER_ANCHORS` | Нет | Лимит якорей (1–100), по умолчанию `25`. |
+| `MAX_USER_ANCHORS` | Нет | Лимит якорей (0–100), по умолчанию `25`. |
 | `TAVILY_TIMEOUT_SECONDS` | Нет | Базовый таймаут HTTP Tavily в секундах (10–120), по умолчанию `36`. |
 | `TAVILY_MAX_RETRIES` | Нет | Число **дополнительных** попыток при таймауте (0–5), по умолчанию `2` (итого до 3 запросов). |
 | `TAVILY_RETRY_BACKOFF_MULTIPLIER` | Нет | Множитель паузы между попытками (1.0–4.0), по умолчанию `2.0`. |
@@ -349,8 +355,8 @@ telegram-ai-bot/
 ```bash
 sudo apt update && sudo apt install -y python3 python3-venv python3-pip git
 sudo useradd -r -m -s /bin/bash tgbot   # опционально отдельный пользователь
-sudo mkdir -p /opt/telegram-ai-bot
-sudo chown tgbot:tgbot /opt/telegram-ai-bot
+sudo mkdir -p /opt/bots/telegram-ai-bot
+sudo chown tgbot:tgbot /opt/bots/telegram-ai-bot
 ```
 
 Скопируйте проект, создайте venv, установите зависимости, положите `.env` с секретами.
@@ -363,21 +369,23 @@ sudo chown tgbot:tgbot /opt/telegram-ai-bot
 
 ### Unit-файл systemd
 
-`/etc/systemd/system/kuzma-bot.service`:
+Прод на этом VPS: путь `/opt/bots/telegram-ai-bot`, unit `kuzya-bot.service` (`Restart=on-failure`). Prometheus/Grafana к Кузе **не** подключаются.
+
+`/etc/systemd/system/kuzya-bot.service`:
 
 ```ini
 [Unit]
-Description=Kuzma Telegram AI Bot
+Description=Kuzya (Кузьма) Telegram AI Bot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=tgbot
-Group=tgbot
-WorkingDirectory=/opt/telegram-ai-bot
+User=root
+WorkingDirectory=/opt/bots/telegram-ai-bot
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/telegram-ai-bot/.venv/bin/python /opt/telegram-ai-bot/main.py
+EnvironmentFile=/opt/bots/telegram-ai-bot/.env
+ExecStart=/opt/bots/telegram-ai-bot/venv/bin/python /opt/bots/telegram-ai-bot/main.py
 Restart=on-failure
 RestartSec=10
 
@@ -387,11 +395,11 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now kuzma-bot.service
-sudo journalctl -u kuzma-bot.service -f
+sudo systemctl enable --now kuzya-bot.service
+sudo journalctl -u kuzya-bot.service -f
 ```
 
-Перезапуск: `sudo systemctl restart kuzma-bot.service`.
+Перезапуск: `sudo systemctl restart kuzya-bot.service`.
 
 ### Бэкап SQLite
 
@@ -399,10 +407,10 @@ sudo journalctl -u kuzma-bot.service -f
 
 ```bash
 # остановить бота на время бэкапа — согласованно с окном обслуживания
-sudo systemctl stop kuzma-bot.service
-cp /opt/telegram-ai-bot/bot_database.db /backup/bot_database_$(date +%F).db
-cp /opt/telegram-ai-bot/bot_statistics.db /backup/bot_statistics_$(date +%F).db
-sudo systemctl start kuzma-bot.service
+sudo systemctl stop kuzya-bot.service
+cp /opt/bots/telegram-ai-bot/bot_database.db /backup/bot_database_$(date +%F).db
+cp /opt/bots/telegram-ai-bot/bot_statistics.db /backup/bot_statistics_$(date +%F).db
+sudo systemctl start kuzya-bot.service
 ```
 
 ---
