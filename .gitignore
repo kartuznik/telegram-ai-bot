@@ -4,6 +4,6 @@ __pycache__/
 *.pyc
 .venv/
 *.log
-test_*.py
+/test_*.py
 
 venv/

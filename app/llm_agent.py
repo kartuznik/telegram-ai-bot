@@ -13,6 +13,13 @@ from tavily.errors import BadRequestError
 from tavily.errors import TimeoutError as TavilyTimeoutError
 
 from app.config import Config
+from app.citations import (
+    SourceItem,
+    filter_relevant_sources,
+    format_sources_context_for_llm,
+    freshness_honesty_note,
+    normalize_source_items,
+)
 from app.memory import ChatMemory
 from app.proxy_utils import socks5_proxy_url_from_config
 from app.user_style import detect_style_updates, format_style_block
@@ -301,6 +308,8 @@ class AgentResponse:
     answer: str
     buttons: list[dict[str, str]]
     is_generic: bool = False
+    sources: list[SourceItem] | None = None
+    honesty_note: str = ""
 
 
 @dataclass
@@ -751,6 +760,8 @@ class LLMAgent:
         allow_clarification: bool = True,
     ) -> AgentResponse:
         enhanced_user_text = user_text
+        web_sources: list[SourceItem] = []
+        honesty = ""
         trigger_reason = self._web_search_trigger_reason(user_text)
         if trigger_reason:
             logger.info(
@@ -758,10 +769,16 @@ class LLMAgent:
                 trigger_reason,
                 user_id,
             )
-            search_context = self.search_with_tavily(user_text[:300])
+            search_context, web_sources, honesty = self.search_web_structured(
+                user_text[:300]
+            )
+            honesty_block = f"\n{honesty}\n" if honesty else ""
             enhanced_user_text = (
                 f"{user_text}\n\n"
-                "Ниже результаты веб-поиска. Используй их в ответе:\n"
+                f"{honesty_block}"
+                "Ниже результаты веб-поиска. Используй их в ответе; "
+                "не выдумывай факты вне источников. "
+                "Если выше есть предупреждение о дате данных — явно укажи дату в ответе.\n"
                 f"{search_context}"
             )
 
@@ -821,9 +838,15 @@ class LLMAgent:
                         self._clarify_followup_pending.pop(user_id, None)
                     elif clarification_extra == CLARIFICATION_SYSTEM_OVERLAY:
                         self._clarify_followup_pending[user_id] = True
+                if honesty and honesty not in clean_text:
+                    clean_text = f"{honesty}\n\n{clean_text}"
                 self.memory.save_user_memory(user_id, user_text, clean_text)
                 return AgentResponse(
-                    answer=clean_text, buttons=buttons, is_generic=is_generic
+                    answer=clean_text,
+                    buttons=buttons,
+                    is_generic=is_generic,
+                    sources=web_sources or None,
+                    honesty_note=honesty,
                 )
             except APITimeoutError:
                 if attempt < max_attempts:
@@ -1139,15 +1162,25 @@ class LLMAgent:
 
         return None
 
-    def search_with_tavily(self, query: str) -> str:
+    def search_web_structured(
+        self, query: str
+    ) -> tuple[str, list[SourceItem], str]:
+        """
+        Tavily search → relevance filter → LLM context + sources for Telegram Sources msg.
+
+        Returns (context_for_llm, filtered_sources, honesty_note).
+        """
         if not self.tavily:
             logger.warning("Tavily: поиск пропущен — нет API ключа")
-            return "🌐 Поиск недоступен: добавь TAVILY_API_KEY в .env"
+            return (
+                "🌐 Поиск недоступен: добавь TAVILY_API_KEY в .env",
+                [],
+                "",
+            )
         need_freshness = self._should_trigger_web_search(query)
         days = max(1, int(self._tavily_freshness_days or 2))
-        search_kwargs: dict = {"max_results": 3}
+        search_kwargs: dict = {"max_results": 5}
         if need_freshness:
-            # Канон freshness (минимум этапа 1): topic=news + days; без country (часто 400 на news).
             search_kwargs.update(
                 {
                     "topic": "news",
@@ -1167,7 +1200,6 @@ class LLMAgent:
             )
         result = self._tavily_search(query, **search_kwargs)
         if result is None and need_freshness:
-            # Fallback: расширить окно days×2 при пустой/упавшей выдаче.
             wider = min(30, days * 2)
             logger.warning(
                 "Tavily core freshness empty/fail days=%s; fallback days=%s",
@@ -1176,36 +1208,52 @@ class LLMAgent:
             )
             result = self._tavily_search(
                 query,
-                max_results=3,
+                max_results=5,
                 topic="news",
                 days=wider,
                 include_published_date=True,
             )
         if result is None:
-            return "🌐 Не удалось выполнить веб-поиск. Попробуй повторить запрос позже."
-        items = result.get("results", [])
-        if not items:
-            logger.info("Tavily: пустой список results")
-            return "🌐 Не нашел результатов, попробуй уточнить запрос."
-        lines = []
-        for item in items:
-            title = item.get("title", "Без названия")
-            url = item.get("url", "")
-            content = (item.get("content", "") or "").strip().replace("\n", " ")
-            published = (
-                item.get("published_date")
-                or item.get("published_at")
-                or item.get("published")
-                or ""
+            return (
+                "🌐 Не удалось выполнить веб-поиск. Попробуй повторить запрос позже.",
+                [],
+                "",
             )
-            pub_bit = f"\n📅 {published}" if published else ""
-            lines.append(f"— {title}\n({url}){pub_bit}\n{content[:240]}")
+        raw_items = result.get("results", []) or []
+        if not raw_items:
+            logger.info("Tavily: пустой список results")
+            honesty = freshness_honesty_note(query, [], days=days)
+            return (
+                "🌐 Не нашел результатов, попробуй уточнить запрос.",
+                [],
+                honesty,
+            )
+        normalized = normalize_source_items(raw_items)
+        filtered = filter_relevant_sources(query, normalized)
+        honesty = freshness_honesty_note(query, filtered, days=days)
         logger.info(
-            "Tavily: сформирован контекст для модели, результатов=%s need_freshness=%s",
-            len(items),
+            "Tavily: raw=%s after_relevance=%s need_freshness=%s honesty=%s",
+            len(normalized),
+            len(filtered),
             need_freshness,
+            bool(honesty),
         )
-        return "🌐 Результаты веб-поиска:\n" + "\n\n".join(lines)
+        if not filtered:
+            return (
+                "🌐 После фильтра релевантности источников не осталось. "
+                "Попробуй уточнить запрос.",
+                [],
+                honesty,
+            )
+        context = (
+            "🌐 Результаты веб-поиска (используй факты и URL):\n"
+            + format_sources_context_for_llm(filtered)
+        )
+        return context, filtered, honesty
+
+    def search_with_tavily(self, query: str) -> str:
+        context, _sources, _honesty = self.search_web_structured(query)
+        return context
 
     def run_raw_completion(
         self,

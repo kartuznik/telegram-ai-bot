@@ -241,17 +241,30 @@ async def reply_with_help_text(
     await message.answer(build_help_text(is_admin=adm))
 
 
-def build_keyboard_from_buttons(buttons: list[dict[str, str]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=button["text"], callback_data=button["callback_data"]
-                )
-                for button in buttons
-            ]
-        ]
+def build_keyboard_from_buttons(
+    buttons: list[dict[str, str]],
+    *,
+    concierge_enabled: bool = True,
+) -> InlineKeyboardMarkup:
+    from app.citations import filter_out_concierge_buttons
+
+    filtered = filter_out_concierge_buttons(
+        buttons, concierge_enabled=concierge_enabled
     )
+    rows: list[list[InlineKeyboardButton]] = []
+    for button in filtered:
+        text = str(button.get("text") or "").strip() or "…"
+        url = str(button.get("url") or "").strip()
+        if url:
+            rows.append([InlineKeyboardButton(text=text[:64], url=url)])
+            continue
+        cb = str(button.get("callback_data") or "").strip()
+        if not cb:
+            continue
+        rows.append([InlineKeyboardButton(text=text[:64], callback_data=cb[:64])])
+    if not rows:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_default_keyboard() -> tuple[InlineKeyboardMarkup, list[dict[str, str]]]:

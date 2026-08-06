@@ -650,13 +650,51 @@ async def _send_anchors_list(message: Message, user_id: int) -> None:
 
 
 async def send_ai_reply(
-    message: Message, text: str, buttons: list[dict[str, str]] | None = None
+    message: Message,
+    text: str,
+    buttons: list[dict[str, str]] | None = None,
+    *,
+    sources: list | None = None,
 ) -> None:
-    if buttons:
-        keyboard = build_keyboard_from_buttons(buttons)
+    from app.citations import (
+        build_sources_keyboard,
+        filter_out_concierge_buttons,
+        format_sources_message_html,
+    )
+
+    concierge_on = bool(getattr(config, "concierge_enabled", False))
+    safe_buttons = filter_out_concierge_buttons(
+        buttons, concierge_enabled=concierge_on
+    )
+    if safe_buttons:
+        keyboard = build_keyboard_from_buttons(
+            safe_buttons, concierge_enabled=concierge_on
+        )
     else:
         keyboard, _ = build_default_keyboard()
+
+    # Draft (model answer) — plain text; Sources go as a separate HTML message.
     await message.answer(text, reply_markup=keyboard)
+
+    if sources:
+        sources_html = format_sources_message_html(sources)
+        if sources_html:
+            sources_kb = build_sources_keyboard(sources)
+            preview_kwargs: dict = {"parse_mode": "HTML", "reply_markup": sources_kb}
+            try:
+                from aiogram.types import LinkPreviewOptions
+
+                preview_kwargs["link_preview_options"] = LinkPreviewOptions(
+                    is_disabled=True
+                )
+                await message.answer(sources_html, **preview_kwargs)
+            except TypeError:
+                await message.answer(
+                    sources_html,
+                    parse_mode="HTML",
+                    reply_markup=sources_kb,
+                    disable_web_page_preview=True,
+                )
 
 
 def resolve_proactive_buttons(
@@ -2466,7 +2504,12 @@ async def text_handler(message: Message, bot: Bot) -> None:
         getattr(response, "is_generic", False),
         user_query=message.text,
     )
-    await send_ai_reply(message, response.answer, buttons)
+    await send_ai_reply(
+        message,
+        response.answer,
+        buttons,
+        sources=getattr(response, "sources", None),
+    )
 
 
 @router.message(F.document)
@@ -2566,7 +2609,12 @@ async def document_handler(message: Message, bot: Bot) -> None:
         getattr(response, "is_generic", False),
         user_query=None,
     )
-    await send_ai_reply(message, response.answer, buttons)
+    await send_ai_reply(
+        message,
+        response.answer,
+        buttons,
+        sources=getattr(response, "sources", None),
+    )
 
 
 @router.message(F.photo)
@@ -2732,7 +2780,12 @@ async def voice_handler(message: Message, bot: Bot) -> None:
             getattr(response, "is_generic", False),
             user_query=voice_text,
         )
-        await send_ai_reply(message, response.answer, buttons)
+        await send_ai_reply(
+        message,
+        response.answer,
+        buttons,
+        sources=getattr(response, "sources", None),
+    )
     except Exception as exc:
         logger.exception("Ошибка обработки голосового: %s", exc)
         await message.answer("Не удалось обработать голосовое сообщение 😥")
@@ -3234,20 +3287,26 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
         if not query:
             await callback.message.answer("Не пойму, по чему искать — напиши запрос текстом 🔎")
             return
-        search_result = agent.search_with_tavily(query[:400])
+        search_context, web_sources, honesty = agent.search_web_structured(query[:400])
         logger.info("Консьерж: Tavily для user_id=%s", user_id)
+        honesty_bit = f"\n{honesty}\n" if honesty else ""
         response = agent.process_message_with_agent(
             user_id=user_id,
             user_text=(
                 "Пользователь нажал кнопку «да, помоги действием» (консьерж). "
                 f"Исходный запрос для поиска: {query}\n\n"
-                f"Результаты веб-поиска:\n{search_result}\n\n"
-                "Собери конкретный полезный ответ: варианты, факты, ссылки в скобках как в правилах. "
+                f"{honesty_bit}"
+                f"Результаты веб-поиска:\n{search_context}\n\n"
+                "Собери конкретный полезный ответ: варианты, факты. "
                 "Если поиск недоступен, пуст или только заглушка — честно скажи и предложи уточнить город, даты, бюджет "
                 "или включить веб-поиск в настройках. Стиль Кузьмы."
             ),
             skip_concierge_tracking=True,
         )
+        if honesty and honesty not in response.answer:
+            response.answer = f"{honesty}\n\n{response.answer}"
+        if web_sources and not response.sources:
+            response.sources = web_sources
         logger.info("Отправляю ответ пользователю")
         buttons = resolve_proactive_buttons(
             user_id,
@@ -3256,7 +3315,12 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             getattr(response, "is_generic", False),
             user_query=query or None,
         )
-        await send_ai_reply(callback.message, response.answer, buttons)
+        await send_ai_reply(
+            callback.message,
+            response.answer,
+            buttons,
+            sources=getattr(response, "sources", None),
+        )
     elif data == "find_draft_topic":
         await _create_new_draft_for_user(
             callback.message,
@@ -3277,13 +3341,21 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
                 query = f"свежие последние новости: {last_user_message[:260]}"
             else:
                 query = last_user_message[:300]
-            search_result = agent.web_search(query)
+            search_context, web_sources, honesty = agent.search_web_structured(query)
+            honesty_bit = f"\n{honesty}\n" if honesty else ""
             logger.info("Callback: запускаю агента")
             response = agent.process_message_with_agent(
                 user_id=user_id,
-                user_text=f"Используй результаты веб-поиска и ответь пользователю:\n{search_result}",
+                user_text=(
+                    f"{honesty_bit}"
+                    f"Используй результаты веб-поиска и ответь пользователю:\n{search_context}"
+                ),
                 skip_concierge_tracking=True,
             )
+            if honesty and honesty not in response.answer:
+                response.answer = f"{honesty}\n\n{response.answer}"
+            if web_sources and not response.sources:
+                response.sources = web_sources
             logger.info("Callback: агент вернул ответ")
             logger.info("Отправляю ответ пользователю")
             buttons = resolve_proactive_buttons(
@@ -3293,7 +3365,12 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
                 getattr(response, "is_generic", False),
                 user_query=last_user_message or None,
             )
-            await send_ai_reply(callback.message, response.answer, buttons)
+            await send_ai_reply(
+                callback.message,
+                response.answer,
+                buttons,
+                sources=getattr(response, "sources", None),
+            )
     elif data == "clear_history":
         memory.clear_user_memory(user_id)
         agent.clear_clarification_pending(user_id)
@@ -3315,7 +3392,12 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             getattr(response, "is_generic", False),
             user_query=None,
         )
-        await send_ai_reply(callback.message, response.answer, buttons)
+        await send_ai_reply(
+            callback.message,
+            response.answer,
+            buttons,
+            sources=getattr(response, "sources", None),
+        )
 
 
 async def main() -> None:
