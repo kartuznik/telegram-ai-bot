@@ -301,9 +301,3 @@ def get_channel_quality_top_bottom(
     except Exception as exc:
         logger.exception("Статистика: get_channel_quality_top_bottom: %s", exc)
         return [], []
-
-
-def reset_stats_db_path_for_tests() -> None:
-    """Сброс пути к БД (только для тестов)."""
-    global _db_path
-    _db_path = None

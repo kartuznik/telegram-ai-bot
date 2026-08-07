@@ -2232,36 +2232,6 @@ def format_search_window_settings_message(prefs: dict[str, str]) -> str:
     )
 
 
-def format_search_settings_message(prefs: dict[str, str]) -> str:
-    """Сводка всего, что влияет на подбор материалов (для /searchsettings)."""
-    sm = get_source_mode(prefs)
-    tg_raw = (prefs.get(PREF_TG_CHANNELS) or "").strip()
-    tg_parsed = _parse_username_csv(tg_raw)
-    if tg_parsed:
-        tg_line = (
-            "⚙️ TG для подбора: "
-            + ", ".join(f"@{x}" for x in tg_parsed)
-            + " (только эти; общий список не подмешивается)."
-        )
-    else:
-        tg_line = (
-            "⚙️ TG для подбора: общий список по умолчанию "
-            "(свои каналы: /editor_prefs тгканалы:@…)."
-        )
-    lines = [
-        "Настройки поиска для подбора черновиков:",
-        "",
-        format_topics_settings_message(prefs.get(PREF_TOPICS)),
-        format_sources_settings_message(prefs.get(PREF_SOURCES)),
-        format_search_window_settings_message(prefs),
-        f"⚙️ Режим материалов: {sm} (web / tg / both).",
-        tg_line,
-        "",
-        "Правки: /topics, /sources, /searchwindow; режим и TG — через /editor_prefs.",
-    ]
-    return "\n".join(lines)
-
-
 def _score_matches_user_topics(
     score_map: dict[str, int], user_topics: list[str], post_text_low: str
 ) -> tuple[bool, str]:
