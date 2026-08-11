@@ -1,4 +1,4 @@
-"""Редактор контента: Tavily + черновик → апрув в ЛС → публикация в канал @kriptogeograph."""
+"""Редактор контента: Tavily + черновик → апрув в ЛС → публикация в канал из .env."""
 from __future__ import annotations
 
 import json
@@ -65,12 +65,9 @@ except ImportError:
     def score_text(text: str) -> dict[str, int]:
         return {}
 
-# Канал @kriptogeograph (v1 — константа; позже можно вынести в config)
-DEFAULT_EDITOR_CHANNEL_ID = "-1001985473246"
 MAX_POST_CHARS = 1000
 
 PREF_ENABLED = "content_editor_enabled"
-PREF_CHANNEL = "content_editor_channel_id"
 PREF_TOPICS = "content_editor_topics"
 PREF_SOURCES = "content_editor_sources"
 PREF_REJECT_HINTS = "content_editor_reject_hints"
@@ -282,9 +279,10 @@ CB_SEEN = "s"  # уже видел — исключить URL, без отказ
 _pending_edit: dict[int, int] = {}
 _pending_feedback: dict[int, dict[str, Any]] = {}
 _pending_learning: dict[int, str] = {}
+_EDITOR_CHANNEL_ID: str | None = None
 
 DRAFT_SYSTEM = (
-    "Ты — Кузьма, редактор коротких постов для Telegram-канала @kriptogeograph. "
+    "Ты — Кузьма, редактор коротких постов для Telegram-канала пользователя. "
     "Темы задаёт пользователь — это могут быть новости, наука, шоу-бизнес, технологии, путешествия, спорт и что угодно ещё; "
     "не впихивай финансовую рамку, если материал не про деньги, рынки или вложения.\n"
     "Пиши в новостном стиле: факты, событие, что произошло и почему это важно.\n"
@@ -532,7 +530,7 @@ def parse_deadline_directive_from_rest(rest: str) -> tuple[str, dict[str, str] |
 
 def init_content_editor_defaults(cfg: Config | None = None) -> None:
     """Подставляет дефолтный список публичных TG-каналов из Config (env)."""
-    global _TG_DEFAULT_USERNAMES, _EXCLUDE_POSTED_DAYS, _EXCLUDE_REJECTED_DAYS
+    global _TG_DEFAULT_USERNAMES, _EXCLUDE_POSTED_DAYS, _EXCLUDE_REJECTED_DAYS, _EDITOR_CHANNEL_ID
     if cfg is None:
         return
     pd = int(getattr(cfg, "content_editor_exclude_posted_days", 30) or 30)
@@ -540,6 +538,12 @@ def init_content_editor_defaults(cfg: Config | None = None) -> None:
     _EXCLUDE_POSTED_DAYS = max(1, min(365, pd))
     _EXCLUDE_REJECTED_DAYS = max(1, min(365, rd))
     raw = (getattr(cfg, "content_editor_tg_default_channels", None) or "").strip()
+    ch_raw = (getattr(cfg, "content_editor_channel_id", None) or "").strip()
+    _EDITOR_CHANNEL_ID = ch_raw or None
+    if not _EDITOR_CHANNEL_ID:
+        logger.info(
+            "content_editor soft-disabled: CONTENT_EDITOR_CHANNEL_ID is empty; editor publish flow is unavailable"
+        )
     if not raw:
         return
     parsed = _parse_username_csv(raw)
@@ -2882,7 +2886,7 @@ def channel_publish_text_from_draft_body(body: str) -> str:
 
 def draft_dm_text(row: dict[str, Any]) -> str:
     sid = row.get("source_url") or ""
-    head = "✍️ Черновик для канала @kriptogeograph — глянь и реши судьбу поста:\n\n"
+    head = "✍️ Черновик для вашего канала — глянь и реши судьбу поста:\n\n"
     body = str(row.get("content") or "")
     meta_lines: list[str] = []
     cs = row.get("confidence_score")
@@ -4337,7 +4341,16 @@ def create_draft_from_search(
         (picked.url or "")[:120],
         picked.from_telegram,
     )
-    ch = prefs.get(PREF_CHANNEL) or DEFAULT_EDITOR_CHANNEL_ID
+    ch = _EDITOR_CHANNEL_ID
+    if not ch:
+        logger.info("create_draft_from_search soft-disabled: CONTENT_EDITOR_CHANNEL_ID is empty")
+        return (
+            False,
+            "Редактор канала сейчас вежливо отключён: в .env не задан CONTENT_EDITOR_CHANNEL_ID. "
+            "Передайте владельцу: добавьте ID канала, перезапустите сервис — и публикация заработает. "
+            "Остальные функции бота работают.",
+            None,
+        )
     ok, res = insert_draft(
         user_id,
         ch,
@@ -4362,6 +4375,10 @@ def create_draft_from_search(
     if not row:
         return False, "Черновик создался, но не читается из базы — мистика БД 🫠", None
     return True, int(res), draft_dm_text(row)
+
+
+def get_editor_channel_id() -> str | None:
+    return _EDITOR_CHANNEL_ID
 
 
 def create_draft_for_specific_topic(

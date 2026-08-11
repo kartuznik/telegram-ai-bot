@@ -34,11 +34,9 @@ from app.admin import (
 from app.content_editor import (
     AUTO_DIRECTIVE_RE,
     DRAFT_SYSTEM,
-    DEFAULT_EDITOR_CHANNEL_ID,
     PREF_APPROVE_COUNT,
     PREF_AUTO_INTRO_SENT,
     PREF_LAST_AUTO_FETCH_TS,
-    PREF_CHANNEL,
     PREF_ENABLED,
     PREF_REJECT_COUNT,
     PREF_SEARCH_WINDOW_DAYS,
@@ -86,6 +84,7 @@ from app.content_editor import (
     format_search_window_settings_message,
     format_sources_settings_message,
     format_topics_settings_message,
+    get_editor_channel_id,
     get_draft,
     get_oldest_draft,
     get_pending_edit,
@@ -1229,7 +1228,14 @@ async def _create_editor_draft_from_text(
         if source_line.lower() not in body.lower():
             body = f"{body.rstrip()}\n\n{source_line}"
 
-    ch = prefs.get(PREF_CHANNEL) or DEFAULT_EDITOR_CHANNEL_ID
+    ch = get_editor_channel_id()
+    if not ch:
+        logger.info("draft_from_file soft-disabled: CONTENT_EDITOR_CHANNEL_ID is empty")
+        await message.answer(
+            "Редактор канала сейчас вежливо отключён: в .env не задан CONTENT_EDITOR_CHANNEL_ID. "
+            "Передайте владельцу: добавить ID канала и перезапустить сервис. Остальные функции бота работают."
+        )
+        return False
     deadline_h = draft_deadline_hours_from_prefs(prefs)
     ok, res = await asyncio.to_thread(
         insert_draft,
@@ -1315,17 +1321,23 @@ async def editor_start_cmd(message: Message) -> None:
         uid,
         {
             PREF_ENABLED: "1",
-            PREF_CHANNEL: DEFAULT_EDITOR_CHANNEL_ID,
         },
     )
     pop_pending_edit(uid)
-    await message.answer(
-        f"Редактор включён 🎉 Цель — канал @kriptogeograph (`{DEFAULT_EDITOR_CHANNEL_ID}`). "
-        "Дальше всё просто: /topics — рулим темами, /searchmode — выбираем источник (web/tg/both), "
-        "/automode — настраиваем интервал авто-поиска, а /drafts приносит черновик вручную. "
-        "С черновиками работаем кнопками: ✅ публикуем, ✏️ правим, ❌ скипаем, 🕐 откладываем. "
-        "Без твоего окея в канал ничего не полетит 🎯"
-    )
+    if get_editor_channel_id():
+        await message.answer(
+            "Редактор включён 🎉 Кузя работает с вашим каналом: канал задаётся в .env. "
+            "Дальше всё просто: /topics — рулим темами, /searchmode — выбираем источник (web/tg/both), "
+            "/automode — настраиваем интервал авто-поиска, а /drafts приносит черновик вручную. "
+            "С черновиками работаем кнопками: ✅ публикуем, ✏️ правим, ❌ скипаем, 🕐 откладываем. "
+            "Без твоего окея в канал ничего не полетит 🎯"
+        )
+    else:
+        await message.answer(
+            "Редактор включён в демо-режиме: канал пока не задан в .env (`CONTENT_EDITOR_CHANNEL_ID`). "
+            "Кузя работает с вашим каналом, но до настройки значения публикация вежливо отключена; "
+            "остальные функции работают. После настройки владельцем — перезапустите сервис."
+        )
 
 
 @router.message(Command("editor_stop"))
@@ -3106,7 +3118,7 @@ async def callback_handler(callback: CallbackQuery, bot: Bot) -> None:
             if src_ch:
                 bump_channel_quality(src_ch, approved_inc=1)
             await callback.message.answer(
-                "Пост улетел в @kriptogeograph — ты на режиссёре, я на суфлёре 🎬✅"
+                "Пост улетел в ваш канал — ты на режиссёре, я на суфлёре 🎬✅"
             )
             _schedule_ask_why(bot, callback.message.chat.id, user_id, did, "approved", body)
             pending_after = count_drafts(user_id, "draft")

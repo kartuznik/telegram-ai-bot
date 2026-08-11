@@ -95,6 +95,7 @@ class Config:
     concierge_enabled: bool = True
     anchors_enabled: bool = True
     content_editor_autofetch_enabled: bool = False
+    content_editor_channel_id: str | None = None
     tavily_freshness_days: int = 2
     log_level: str = "INFO"
     telegram_proxy_fallback_direct: bool = False
@@ -178,6 +179,7 @@ def load_config() -> Config:
     ).strip() == "":
         autofetch_on = False
     tavily_freshness_days = _parse_int_env("TAVILY_FRESHNESS_DAYS", 2, 1, 30)
+    editor_channel_id = os.getenv("CONTENT_EDITOR_CHANNEL_ID", "").strip() or None
     log_level = _parse_log_level_env("LOG_LEVEL", "INFO")
     telegram_proxy_fallback = _parse_bool_env("TELEGRAM_PROXY_FALLBACK_DIRECT", False)
     max_templates = _parse_int_env("MAX_USER_TEMPLATES", 30, 1, 100)
@@ -232,6 +234,7 @@ def load_config() -> Config:
         concierge_enabled=concierge_on,
         anchors_enabled=anchors_on,
         content_editor_autofetch_enabled=autofetch_on,
+        content_editor_channel_id=editor_channel_id,
         tavily_freshness_days=tavily_freshness_days,
         log_level=log_level,
         telegram_proxy_fallback_direct=telegram_proxy_fallback,

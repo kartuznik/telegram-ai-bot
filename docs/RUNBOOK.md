@@ -12,6 +12,8 @@ cd /opt/bots/telegram-ai-bot
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 # заполнить .env (TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, …) — не коммитить
+# Кузя работает с вашим каналом: CONTENT_EDITOR_CHANNEL_ID задаётся в .env;
+# если значение пустое, редактор канала вежливо отключён, остальные функции работают.
 sudo systemctl daemon-reload
 sudo systemctl enable --now kuzya-bot.service
 sudo systemctl status kuzya-bot.service
